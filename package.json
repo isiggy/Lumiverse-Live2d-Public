@@ -1,0 +1,21 @@
+{
+  "name": "lumiverse-live2d",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:backend": "bun build src/backend.ts --outfile dist/backend.js --target bun",
+    "build:frontend": "bun build src/frontend.ts --outfile dist/frontend.js --target browser",
+    "build": "bun run build:backend && bun run build:frontend",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "fflate": "^0.8.2"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "@types/node": "^26.4.0",
+    "lumiverse-spindle-types": "^0.6.23",
+    "typescript": "^5.9.3"
+  }
+}

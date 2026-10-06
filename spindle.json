@@ -1,0 +1,19 @@
+{
+  "version": "1.0.0",
+  "name": "Live2D Avatars",
+  "identifier": "live2d_avatars",
+  "author": "isiggy",
+  "github": "https://github.com/isiggy/Lumiverse-Live2d-Public",
+  "homepage": "https://github.com/isiggy/Lumiverse-Live2d-Public",
+  "description": "Use Live2D animated models as character avatars. Imports Cubism 2.1 and Cubism 3/4 model ZIPs, plays expressions and motions from LLM-classified emotions, supports hit-area interactions, cursor following, talking mouth animation, and full per-character model settings.",
+  "permissions": [
+    "generation",
+    "characters",
+    "chats",
+    "chat_mutation",
+    "app_manipulation"
+  ],
+  "entry_backend": "dist/backend.js",
+  "entry_frontend": "dist/frontend.js",
+  "minimum_lumiverse_version": "1.0.6"
+}
