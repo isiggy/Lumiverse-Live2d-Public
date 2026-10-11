@@ -288,6 +288,80 @@ class ModelAssets {
   }
 }
 
+// src/frontend/columns.ts
+var REGISTRY_KEY = "__lumiverseAvatarColumns";
+var CHANGED_EVENT = "lumiverse-avatar-columns-changed";
+function registry() {
+  const scope = window;
+  const existing = scope[REGISTRY_KEY];
+  if (existing?.version === 1 && existing.extensions && typeof existing.extensions === "object") {
+    return existing;
+  }
+  const fresh = { version: 1, extensions: {} };
+  scope[REGISTRY_KEY] = fresh;
+  return fresh;
+}
+function sameList(a, b) {
+  return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+function sameColumns(a, b) {
+  if (a.count !== b.count || a.index.size !== b.index.size)
+    return false;
+  for (const [characterId, column] of a.index) {
+    if (b.index.get(characterId) !== column)
+      return false;
+  }
+  return true;
+}
+
+class SharedColumns {
+  extensionId;
+  onChange;
+  published = null;
+  listener = (event) => {
+    if (event.detail?.extension !== this.extensionId)
+      this.onChange();
+  };
+  constructor(extensionId, onChange) {
+    this.extensionId = extensionId;
+    this.onChange = onChange;
+    window.addEventListener(CHANGED_EVENT, this.listener);
+  }
+  publish(characterIds) {
+    const sorted = [...new Set(characterIds)].sort();
+    if (this.published && sameList(sorted, this.published))
+      return;
+    this.published = sorted;
+    registry().extensions[this.extensionId] = sorted;
+    window.dispatchEvent(new CustomEvent(CHANGED_EVENT, { detail: { extension: this.extensionId } }));
+  }
+  layout(members, own, shared) {
+    const withModel = new Set(own);
+    if (shared) {
+      for (const [extension, characterIds] of Object.entries(registry().extensions)) {
+        if (extension === this.extensionId || !Array.isArray(characterIds))
+          continue;
+        for (const characterId of characterIds)
+          withModel.add(characterId);
+      }
+    }
+    const index = new Map;
+    for (const characterId of members) {
+      if (withModel.has(characterId) && !index.has(characterId))
+        index.set(characterId, index.size);
+    }
+    return { count: Math.max(1, index.size), index };
+  }
+  destroy() {
+    window.removeEventListener(CHANGED_EVENT, this.listener);
+    const extensions = registry().extensions;
+    if (!(this.extensionId in extensions))
+      return;
+    delete extensions[this.extensionId];
+    window.dispatchEvent(new CustomEvent(CHANGED_EVENT, { detail: { extension: this.extensionId } }));
+  }
+}
+
 // vendor/live2dcubismcore.min.js
 var live2dcubismcore_min_default = `/**
  * Live2D Cubism Core
@@ -728,16 +802,14 @@ function describeFromBundle(bundleJson, cubism) {
 class Stage {
   deps;
   host = null;
-  canvas = null;
-  app = null;
-  loaded = null;
+  loaded = [];
   chatId = null;
-  characterId = null;
+  characterIds = [];
+  columns = { count: 1, index: new Map };
+  sharedColumns;
   loadToken = 0;
   ticker = null;
   resizeObserver = null;
-  starterTimer = null;
-  thumbnailTimer = null;
   previousInteraction = { characterId: "", message: "" };
   descriptionCache = new Map;
   drag = null;
@@ -757,6 +829,7 @@ class Stage {
     this.deps = deps;
     for (const [target, type, listener, options] of this.listeners)
       target.addEventListener(type, listener, options);
+    this.sharedColumns = new SharedColumns("live2d_avatars", () => this.updateColumns());
   }
   destroy() {
     for (const [target, type, listener, options] of this.listeners) {
@@ -767,10 +840,9 @@ class Stage {
     this.hoverFrame = null;
     this.setHovering(false);
     this.teardownApp();
+    this.sharedColumns.destroy();
     if (this.ticker !== null)
       window.clearInterval(this.ticker);
-    if (this.starterTimer !== null)
-      window.clearTimeout(this.starterTimer);
     this.ticker = null;
   }
   setHost(host) {
@@ -780,76 +852,121 @@ class Stage {
     this.host = host;
     this.reload();
   }
-  setChatContext(chatId, characterId) {
-    const changed = chatId !== this.chatId || characterId !== this.characterId;
+  setChatContext(chatId, characterIds) {
+    const unique = [...new Set(characterIds.filter(Boolean))];
+    const changed = chatId !== this.chatId || unique.length !== this.characterIds.length || unique.some((id, index) => id !== this.characterIds[index]);
     this.chatId = chatId;
-    this.characterId = characterId;
+    this.characterIds = unique;
     if (changed)
       this.reload();
   }
   getChatContext() {
-    return { chatId: this.chatId, characterId: this.characterId };
+    return { chatId: this.chatId, characterIds: [...this.characterIds] };
   }
-  currentModel() {
-    return this.loaded ? { characterId: this.loaded.characterId, modelId: this.loaded.modelId } : null;
+  isOnStage(characterId, modelId) {
+    const entry = this.entryFor(characterId);
+    return entry !== undefined && (modelId === undefined || entry.modelId === modelId);
+  }
+  charactersOnStage() {
+    return this.loaded.map((entry) => entry.characterId);
+  }
+  entryFor(characterId) {
+    return this.loaded.find((entry) => entry.characterId === characterId);
+  }
+  boundCharacters(settings) {
+    const bound = new Map;
+    if (!settings.global.enabled)
+      return bound;
+    for (const [characterId, modelId] of Object.entries(settings.characterModelMapping)) {
+      const record = modelId ? this.deps.getModelRecord(modelId) : undefined;
+      if (record)
+        bound.set(characterId, record);
+    }
+    return bound;
+  }
+  updateColumns() {
+    const own = [...this.boundCharacters(this.deps.getSettings()).keys()];
+    const overApp = this.host !== null && this.deps.drawsOverApp();
+    this.sharedColumns.publish(overApp ? own : []);
+    const columns = this.sharedColumns.layout(this.characterIds, own, overApp);
+    if (sameColumns(columns, this.columns))
+      return;
+    this.columns = columns;
+    this.sortEntries();
+    for (const entry of this.loaded)
+      this.applyLayout(entry);
   }
   async reload() {
     this.teardownApp();
-    const token = ++this.loadToken;
+    const token = this.loadToken;
+    this.updateColumns();
     const settings = this.deps.getSettings();
-    if (!settings.global.enabled || !this.host || !this.characterId)
+    if (!settings.global.enabled || !this.host)
       return;
-    const modelId = settings.characterModelMapping[this.characterId];
-    if (!modelId)
-      return;
-    const record = this.deps.getModelRecord(modelId);
-    if (!record)
+    const bound = this.boundCharacters(settings);
+    const cast = this.characterIds.flatMap((characterId) => {
+      const record = bound.get(characterId);
+      return record ? [{ characterId, record }] : [];
+    });
+    if (cast.length === 0)
       return;
     let PIXI;
-    let bundle;
     try {
-      [PIXI, bundle] = await Promise.all([ensureLive2DRuntime(), this.deps.assets.load(record)]);
+      PIXI = await ensureLive2DRuntime();
     } catch (error) {
-      this.deps.log(`Failed to prepare model: ${String(error)}`);
+      this.deps.log(`Failed to prepare the Live2D runtime: ${String(error)}`);
       return;
     }
     if (token !== this.loadToken || !this.host)
       return;
-    const canvas = document.createElement("canvas");
-    canvas.className = "live2d-avatars-canvas";
-    this.host.appendChild(canvas);
-    this.canvas = canvas;
-    const hostRect = this.host.getBoundingClientRect();
-    if (hostRect.width === 0 || hostRect.height === 0) {
-      this.deps.log(`Stage host has no size yet (${hostRect.width}x${hostRect.height}); waiting for it to be shown.`);
-    }
-    this.app = new PIXI.Application({
-      resolution: 2 * (window.devicePixelRatio || 1),
-      view: canvas,
-      autoStart: true,
-      resizeTo: this.host,
-      backgroundAlpha: 0
-    });
-    this.resizeObserver = new ResizeObserver(() => {
-      if (!this.app)
+    await Promise.all(cast.map(async ({ characterId, record }) => {
+      let bundle;
+      try {
+        bundle = await this.deps.assets.load(record);
+      } catch (error) {
+        this.deps.log(`Failed to download model "${record.name}": ${String(error)}`);
         return;
-      this.app.resize();
-      this.applyLayout();
-    });
-    this.resizeObserver.observe(this.host);
-    try {
-      await this.loadModel(PIXI, record, bundle, token);
-    } catch (error) {
-      this.deps.log(`Failed to load model "${record.name}": ${String(error)}`);
-      this.teardownApp();
-      return;
-    }
-    if (this.ticker === null) {
+      }
+      if (token !== this.loadToken || !this.host)
+        return;
+      try {
+        await this.loadModel(PIXI, characterId, record, bundle, token);
+      } catch (error) {
+        if (token === this.loadToken)
+          this.deps.log(`Failed to load model "${record.name}": ${String(error)}`);
+      }
+    }));
+    if (token === this.loadToken && this.loaded.length > 0 && this.ticker === null) {
       this.ticker = window.setInterval(() => this.tick(), 100);
     }
   }
-  async loadModel(PIXI, record, bundle, token) {
-    const characterId = this.characterId;
+  createApp(PIXI, host) {
+    const canvas = document.createElement("canvas");
+    canvas.className = "live2d-avatars-canvas";
+    host.appendChild(canvas);
+    const hostRect = host.getBoundingClientRect();
+    if (hostRect.width === 0 || hostRect.height === 0) {
+      this.deps.log(`Stage host has no size yet (${hostRect.width}x${hostRect.height}); waiting for it to be shown.`);
+    }
+    const app = new PIXI.Application({
+      resolution: 2 * (window.devicePixelRatio || 1),
+      view: canvas,
+      autoStart: true,
+      resizeTo: host,
+      backgroundAlpha: 0
+    });
+    if (!this.resizeObserver) {
+      this.resizeObserver = new ResizeObserver(() => {
+        for (const entry of this.loaded) {
+          entry.app.resize();
+          this.applyLayout(entry);
+        }
+      });
+      this.resizeObserver.observe(host);
+    }
+    return { app, canvas };
+  }
+  async loadModel(PIXI, characterId, record, bundle, token) {
     const settingsText = await bundle.files.get(bundle.settingsFile)?.text();
     if (!settingsText)
       throw new Error(`Settings file missing from bundle: ${bundle.settingsFile}`);
@@ -858,7 +975,8 @@ class Stage {
     const baseDescription = { ...partialDescription, parameterIds: [] };
     const modelSettings = this.deps.getModelSettings(characterId, record.id, baseDescription, bundle.presetSettings);
     const { model, objectUrls } = await this.instantiate(PIXI, bundle, json, modelSettings.eye);
-    if (token !== this.loadToken || !this.app) {
+    const host = this.host;
+    if (token !== this.loadToken || !host) {
       model.destroy(true, true, true);
       objectUrls.forEach((url) => URL.revokeObjectURL(url));
       return;
@@ -871,10 +989,14 @@ class Stage {
     };
     this.descriptionCache.set(`${record.id}@${record.version}`, description);
     this.autoDetectParameters(modelSettings, description.parameterIds);
+    const { app, canvas } = this.createApp(PIXI, host);
+    app.stage.addChild(model);
     const entry = {
       characterId,
       modelId: record.id,
       model,
+      app,
+      canvas,
       objectUrls,
       lastMotion: null,
       talking: false,
@@ -884,41 +1006,55 @@ class Stage {
       expression: "none",
       expressionAt: 0,
       idleGroup: model.internalModel.motionManager?.groups?.idle,
-      loopingMotion: null
+      loopingMotion: null,
+      starterTimer: null,
+      thumbnailTimer: null
     };
-    this.loaded = entry;
-    this.app.stage.addChild(model);
+    this.loaded.push(entry);
+    this.sortEntries();
     this.applyCursorParams(entry, modelSettings);
     this.applyLayout(entry, modelSettings);
     if (this.deps.getSettings().global.showFrames)
       this.showFrames(entry, true);
     const starter = modelSettings.animation_starter;
     if (starter.expression !== "none" || starter.motion !== "none") {
-      this.starterTimer = window.setTimeout(() => {
-        if (this.loaded !== entry)
+      entry.starterTimer = window.setTimeout(() => {
+        entry.starterTimer = null;
+        if (!this.loaded.includes(entry))
           return;
         if (starter.expression !== "none")
-          this.playExpression(starter.expression);
+          this.playExpression(characterId, starter.expression);
         if (starter.motion !== "none")
-          this.playMotion(starter.motion);
+          this.playMotion(characterId, starter.motion);
       }, Math.max(0, starter.delay));
     }
     if (!record.thumbnail) {
-      this.thumbnailTimer = window.setTimeout(() => {
-        this.thumbnailTimer = null;
-        if (this.loaded !== entry || this.deps.getModelRecord(record.id)?.thumbnail)
+      entry.thumbnailTimer = window.setTimeout(() => {
+        entry.thumbnailTimer = null;
+        if (!this.loaded.includes(entry) || this.deps.getModelRecord(record.id)?.thumbnail)
           return;
-        const dataUrl = this.captureThumbnail();
+        const dataUrl = this.captureThumbnail(characterId);
         if (dataUrl)
           this.deps.saveThumbnail(record.id, dataUrl);
       }, THUMBNAIL_DELAY_MS);
     }
   }
-  captureThumbnail() {
-    const entry = this.loaded;
-    const app = this.app;
-    if (!entry || !app)
+  sortEntries() {
+    const column = (entry) => this.columns.index.get(entry.characterId) ?? 0;
+    this.loaded.sort((a, b) => column(a) - column(b));
+    const host = this.host;
+    if (!host)
+      return;
+    for (const entry of this.loaded) {
+      if (entry.canvas.parentElement === host)
+        host.appendChild(entry.canvas);
+    }
+  }
+  captureThumbnail(characterId) {
+    const entry = this.entryFor(characterId);
+    if (!entry)
       return null;
+    const app = entry.app;
     const view = app.view;
     const pixels = Math.min(THUMBNAIL_RENDER_PIXELS, view.width, view.height);
     if (pixels < 32)
@@ -1012,10 +1148,9 @@ class Stage {
     if (changed)
       this.deps.saveSettingsDebounced();
   }
-  getDescription() {
-    if (!this.loaded)
-      return null;
-    const record = this.deps.getModelRecord(this.loaded.modelId);
+  getDescription(characterId) {
+    const entry = this.entryFor(characterId);
+    const record = entry ? this.deps.getModelRecord(entry.modelId) : undefined;
     if (!record)
       return null;
     return this.descriptionCache.get(`${record.id}@${record.version}`) ?? null;
@@ -1030,9 +1165,10 @@ class Stage {
       throw new Error(`Settings file missing from bundle: ${bundle.settingsFile}`);
     const json = JSON.parse(settingsText);
     const partial = describeFromBundle(json, bundle.cubism);
-    if (this.loaded?.modelId === record.id) {
-      const parameterIds = this.loaded.model.internalModel.coreModel?._model?.parameters?.ids ?? [];
-      const description = { ...partial, parameterIds: [...parameterIds].sort(), size: modelSize(this.loaded.model) };
+    const live = this.loaded.find((entry) => entry.modelId === record.id);
+    if (live) {
+      const parameterIds = live.model.internalModel.coreModel?._model?.parameters?.ids ?? [];
+      const description = { ...partial, parameterIds: [...parameterIds].sort(), size: modelSize(live.model) };
       this.descriptionCache.set(`${record.id}@${record.version}`, description);
       return description;
     }
@@ -1049,30 +1185,49 @@ class Stage {
     const rect = this.host?.getBoundingClientRect();
     return { width: rect?.width ?? 0, height: rect?.height ?? 0 };
   }
-  fitScale(description, rotation) {
+  columnOf(entry) {
     const { width, height } = this.hostSize();
-    if (width === 0 || height === 0 || !description.size)
+    const columnWidth = width / Math.max(1, this.columns.count);
+    return { x: columnWidth * (this.columns.index.get(entry.characterId) ?? 0), width: columnWidth, height };
+  }
+  unitScale(column, size) {
+    const byHeight = column.height / size.height;
+    return this.columns.count > 1 ? Math.min(byHeight, column.width / size.width) : byHeight;
+  }
+  settingsFor(entry) {
+    return this.deps.getModelSettings(entry.characterId, entry.modelId, this.getDescription(entry.characterId));
+  }
+  fitScale(characterId, modelId, rotation) {
+    const entry = this.entryFor(characterId);
+    if (!entry || entry.modelId !== modelId)
       return null;
-    const { width: w, height: h } = description.size;
+    const column = this.columnOf(entry);
+    if (column.width === 0 || column.height === 0)
+      return null;
+    const size = modelSize(entry.model);
     const angle = rotation * Math.PI / 180;
     const cos = Math.abs(Math.cos(angle));
     const sin = Math.abs(Math.sin(angle));
-    const pixelsPerUnit = Math.min(width / (w * cos + h * sin), height / (w * sin + h * cos));
-    return pixelsPerUnit / (height / h);
+    const pixelsPerUnit = Math.min(column.width / (size.width * cos + size.height * sin), column.height / (size.width * sin + size.height * cos));
+    return pixelsPerUnit / this.unitScale(column, size);
   }
-  applyLayout(entry = this.loaded, modelSettings) {
+  applyLayoutFor(characterId) {
+    const entry = this.entryFor(characterId);
     if (!entry)
       return;
-    const settings = modelSettings ?? this.deps.getModelSettings(entry.characterId, entry.modelId, this.getDescription());
-    const { width, height } = this.hostSize();
-    if (width === 0 || height === 0)
+    this.applyLayout(entry);
+    this.applyCursorParams(entry);
+  }
+  applyLayout(entry, modelSettings) {
+    const settings = modelSettings ?? this.settingsFor(entry);
+    const column = this.columnOf(entry);
+    if (column.width === 0 || column.height === 0)
       return;
-    const internalHeight = entry.model.internalModel?.height || entry.model.height || 1;
-    entry.model.scale.set(height / internalHeight * settings.scale);
+    entry.model.scale.set(this.unitScale(column, modelSize(entry.model)) * settings.scale);
     entry.model.anchor.set(0.5, 0.5);
     entry.model.rotation = (settings.rotation || 0) * Math.PI / 180;
-    entry.model.x = width / 2 + width / 2 * settings.x / 100;
-    entry.model.y = height / 2 + height / 2 * settings.y / 100;
+    entry.model.x = column.x + column.width / 2 + column.width / 2 * settings.x / 100;
+    entry.model.y = column.height / 2 + column.height / 2 * settings.y / 100;
     this.applyClip(entry, settings.clip_to_canvas);
   }
   applyClip(entry, clip) {
@@ -1100,10 +1255,10 @@ class Stage {
     entry.model.addChildAt(eraser, 0);
     entry.clip = eraser;
   }
-  applyCursorParams(entry = this.loaded, modelSettings) {
-    if (!entry?.model?.internalModel)
+  applyCursorParams(entry, modelSettings) {
+    if (!entry.model?.internalModel)
       return;
-    const settings = modelSettings ?? this.deps.getModelSettings(entry.characterId, entry.modelId, this.getDescription());
+    const settings = modelSettings ?? this.settingsFor(entry);
     for (const [param, value] of Object.entries(settings.cursor_param)) {
       if (value !== "none") {
         try {
@@ -1114,21 +1269,27 @@ class Stage {
     if (settings.eye !== undefined)
       entry.model.eye_offset = settings.eye;
   }
-  isModelInteraction(event) {
-    const entry = this.loaded;
-    const canvas = this.canvas;
-    if (!entry || !canvas)
-      return false;
+  modelAt(event) {
+    if (this.loaded.length === 0)
+      return null;
     const target = event.target instanceof Element ? event.target : null;
     if (target?.closest(INTERACTIVE_SELECTOR))
-      return false;
-    const previous = canvas.style.pointerEvents;
-    canvas.style.pointerEvents = "auto";
+      return null;
+    const canvases = this.loaded.map((entry) => entry.canvas);
+    for (const canvas of canvases)
+      canvas.style.pointerEvents = "auto";
     const topmost = document.elementFromPoint(event.clientX, event.clientY);
-    canvas.style.pointerEvents = previous;
-    if (topmost !== canvas)
-      return false;
-    return this.isOverModel(entry, this.toStagePoint(event));
+    for (const canvas of canvases)
+      canvas.style.pointerEvents = "";
+    if (!(topmost instanceof HTMLCanvasElement) || !canvases.includes(topmost))
+      return null;
+    const point = this.toStagePoint(event);
+    for (let i = this.loaded.length - 1;i >= 0; i--) {
+      const entry = this.loaded[i];
+      if (this.isOverModel(entry, point))
+        return entry;
+    }
+    return null;
   }
   isOverModel(entry, point) {
     const PIXI = window.PIXI;
@@ -1159,9 +1320,11 @@ class Stage {
     return false;
   }
   onPointerDown(event) {
-    if (event.button !== 0 || !this.isModelInteraction(event))
+    if (event.button !== 0)
       return;
-    const entry = this.loaded;
+    const entry = this.modelAt(event);
+    if (!entry)
+      return;
     event.preventDefault();
     event.stopPropagation();
     const point = this.toStagePoint(event);
@@ -1182,37 +1345,43 @@ class Stage {
       this.dragTo(drag, event);
       return;
     }
-    if (!this.loaded)
+    if (this.loaded.length === 0)
       return;
     if (this.deps.getSettings().global.followCursor) {
-      const rect = this.canvas?.getBoundingClientRect();
+      const rect = this.host?.getBoundingClientRect();
       if (rect) {
-        try {
-          this.loaded.model.focus(event.clientX - rect.left, event.clientY - rect.top);
-        } catch {}
+        for (const entry of this.loaded) {
+          try {
+            entry.model.focus(event.clientX - rect.left, event.clientY - rect.top);
+          } catch {}
+        }
       }
     }
     if (event.pointerType === "mouse" && this.hoverFrame === null) {
       this.hoverFrame = window.requestAnimationFrame(() => {
         this.hoverFrame = null;
-        this.setHovering(this.isModelInteraction(event));
+        this.setHovering(this.modelAt(event) !== null);
       });
     }
   }
   dragTo(drag, event) {
     const { entry } = drag;
+    if (!this.loaded.includes(entry))
+      return;
+    const column = this.columnOf(entry);
+    if (column.width === 0 || column.height === 0)
+      return;
     const point = this.toStagePoint(event);
     const newX = point.x - drag.offsetX;
     const newY = point.y - drag.offsetY;
     if (!drag.moved && Math.abs(newX - entry.model.x) < 3 && Math.abs(newY - entry.model.y) < 3)
       return;
     drag.moved = true;
-    entry.model.x = newX;
-    entry.model.y = newY;
-    const { width, height } = this.hostSize();
-    const settings = this.deps.getModelSettings(entry.characterId, entry.modelId, this.getDescription());
-    settings.x = Math.round((entry.model.x - width / 2) / (width / 2 / 100));
-    settings.y = Math.round((entry.model.y - height / 2) / (height / 2 / 100));
+    const settings = this.settingsFor(entry);
+    const percent = (value) => Math.min(100, Math.max(-100, Math.round(value)));
+    settings.x = percent((newX - column.x - column.width / 2) / (column.width / 2) * 100);
+    settings.y = percent((newY - column.height / 2) / (column.height / 2) * 100);
+    this.applyLayout(entry, settings);
     this.deps.saveSettingsDebounced();
   }
   onPointerUp(event) {
@@ -1222,7 +1391,7 @@ class Stage {
     event.preventDefault();
     event.stopPropagation();
     this.endDrag();
-    if (!drag.moved && this.loaded === drag.entry)
+    if (!drag.moved && this.loaded.includes(drag.entry))
       this.onModelClick(drag.entry, event);
   }
   endDrag() {
@@ -1245,7 +1414,7 @@ class Stage {
     document.documentElement.classList.toggle("live2d-avatars-hover", hovering);
   }
   toStagePoint(event) {
-    const rect = this.canvas?.getBoundingClientRect();
+    const rect = this.host?.getBoundingClientRect();
     return { x: event.clientX - (rect?.left ?? 0), y: event.clientY - (rect?.top ?? 0) };
   }
   async onModelClick(entry, event) {
@@ -1256,7 +1425,7 @@ class Stage {
     } catch {
       hits = [];
     }
-    const settings = this.deps.getModelSettings(entry.characterId, entry.modelId, this.getDescription());
+    const settings = this.settingsFor(entry);
     const modelHitAreas = entry.model.internalModel?.hitAreas ?? {};
     let selected = null;
     let selectedPriority = Number.POSITIVE_INFINITY;
@@ -1280,29 +1449,28 @@ class Stage {
         this.deps.log("Same as last interaction, message not sent again.");
       } else {
         this.previousInteraction = { characterId: entry.characterId, message: mapping.message };
-        this.deps.sendInteraction(mapping.message);
+        this.deps.sendInteraction(mapping.message, entry.characterId);
       }
     }
     if (mapping.expression !== "none")
-      await this.playExpression(mapping.expression);
+      await this.playExpression(entry.characterId, mapping.expression);
     if (mapping.motion !== "none")
-      await this.playMotion(mapping.motion);
+      await this.playMotion(entry.characterId, mapping.motion);
   }
   tick() {
-    const entry = this.loaded;
-    if (!entry)
-      return;
     const globals = this.deps.getSettings().global;
-    if (globals.force_loop && entry.lastMotion) {
+    for (const entry of this.loaded) {
+      if (globals.force_loop && entry.lastMotion) {
+        try {
+          if (!entry.model.internalModel.motionManager.playing) {
+            this.playMotion(entry.characterId, entry.lastMotion);
+          }
+        } catch {}
+      }
       try {
-        if (!entry.model.internalModel.motionManager.playing) {
-          this.playMotion(entry.lastMotion);
-        }
+        this.loopDefault(entry);
       } catch {}
     }
-    try {
-      this.loopDefault(entry);
-    } catch {}
   }
   loopDefault(entry) {
     const manager = entry.model.internalModel?.motionManager;
@@ -1332,12 +1500,12 @@ class Stage {
       return;
     if (performance.now() - entry.expressionAt < EXPRESSION_HOLD_MS)
       return;
-    this.playExpression(mapping.expression);
+    this.playExpression(entry.characterId, mapping.expression);
   }
-  async playExpression(expression) {
-    if (!this.loaded || expression === "none")
+  async playExpression(characterId, expression) {
+    const entry = this.entryFor(characterId);
+    if (!entry || expression === "none")
       return;
-    const entry = this.loaded;
     try {
       await entry.model.expression(expression);
       entry.expression = expression;
@@ -1346,15 +1514,15 @@ class Stage {
       this.deps.log(`Expression "${expression}" failed: ${String(error)}`);
     }
   }
-  async playMotion(motion, force = false) {
-    if (!this.loaded || motion === "none")
+  async playMotion(characterId, motion, force = false) {
+    if (!this.entryFor(characterId) || motion === "none")
       return;
     if (force || this.deps.getSettings().global.force_animation) {
       await this.reload();
-      if (!this.loaded)
-        return;
     }
-    const entry = this.loaded;
+    const entry = this.entryFor(characterId);
+    if (!entry)
+      return;
     const split = motion.split("_id=");
     const group = split[0] ?? motion;
     const id = split[1];
@@ -1368,31 +1536,32 @@ class Stage {
       this.deps.log(`Motion "${motion}" failed: ${String(error)}`);
     }
   }
-  async playTalk(textLength) {
-    const entry = this.loaded;
+  async playTalk(characterId, textLength) {
+    const entry = this.entryFor(characterId);
     if (!entry || textLength <= 0)
       return;
-    const settings = this.deps.getModelSettings(entry.characterId, entry.modelId, this.getDescription());
+    const settings = this.settingsFor(entry);
     const paramId = settings.param_mouth_open_y_id;
     if (paramId === "none")
       return;
     const core = entry.model.internalModel?.coreModel;
     if (typeof core?.addParameterValueById !== "function")
       return;
+    const live = () => this.loaded.includes(entry);
     if (entry.talking) {
       entry.abortTalk = true;
-      while (entry.talking && this.loaded === entry)
+      while (entry.talking && live())
         await delay(50);
       entry.abortTalk = false;
     }
-    if (this.loaded !== entry)
+    if (!live())
       return;
     entry.talking = true;
     const start = Date.now();
     const duration = textLength * settings.mouth_time_per_character;
     try {
       while (Date.now() - start < duration) {
-        if (entry.abortTalk || this.loaded !== entry)
+        if (entry.abortTalk || !live())
           break;
         const coreModel = entry.model?.internalModel?.coreModel;
         if (!coreModel)
@@ -1405,27 +1574,9 @@ class Stage {
       entry.talking = false;
     }
   }
-  setParameter(parameterId, value) {
-    try {
-      this.loaded?.model.internalModel.coreModel.setParameterValueById(parameterId, value);
-    } catch (error) {
-      this.deps.log(`Set parameter failed: ${String(error)}`);
-    }
-  }
-  resetParameters() {
-    const core = this.loaded?.model?.internalModel?.coreModel;
-    const defaults = core?._model?.parameters?.defaultValues;
-    if (!core || !defaults)
-      return;
-    defaults.forEach((value, index) => {
-      try {
-        core.setParameterValueByIndex(index, value);
-      } catch {}
-    });
-  }
   setShowFrames(show) {
-    if (this.loaded)
-      this.showFrames(this.loaded, show);
+    for (const entry of this.loaded)
+      this.showFrames(entry, show);
   }
   showFrames(entry, show) {
     const PIXI = window.PIXI;
@@ -1453,34 +1604,29 @@ class Stage {
   }
   teardownApp() {
     this.loadToken++;
+    if (this.drag)
+      this.suppressClick = false;
     this.drag = null;
     this.setHovering(false);
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
-    if (this.starterTimer !== null) {
-      window.clearTimeout(this.starterTimer);
-      this.starterTimer = null;
-    }
-    if (this.thumbnailTimer !== null) {
-      window.clearTimeout(this.thumbnailTimer);
-      this.thumbnailTimer = null;
-    }
-    if (this.loaded) {
-      this.loaded.abortTalk = true;
+    const entries = this.loaded;
+    this.loaded = [];
+    for (const entry of entries) {
+      if (entry.starterTimer !== null)
+        window.clearTimeout(entry.starterTimer);
+      if (entry.thumbnailTimer !== null)
+        window.clearTimeout(entry.thumbnailTimer);
+      entry.abortTalk = true;
       try {
-        this.loaded.model.destroy(true, true, true);
+        entry.model.destroy(true, true, true);
       } catch {}
-      this.loaded.objectUrls.forEach((url) => URL.revokeObjectURL(url));
-      this.loaded = null;
-    }
-    if (this.app) {
+      entry.objectUrls.forEach((url) => URL.revokeObjectURL(url));
       try {
-        this.app.destroy();
+        entry.app.destroy();
       } catch {}
-      this.app = null;
+      entry.canvas.remove();
     }
-    this.canvas?.remove();
-    this.canvas = null;
   }
 }
 
@@ -1489,7 +1635,7 @@ var REQUIRED_PERMS = [
   { id: "app_manipulation", why: "show the avatar over the app (otherwise it renders inside this tab)" },
   { id: "generation", why: "classify message emotions with the LLM" },
   { id: "chat_mutation", why: "send hit-area interaction messages" },
-  { id: "chats", why: "know which character the active chat belongs to" },
+  { id: "chats", why: "know which characters are in the active chat (needed for group chats)" },
   { id: "characters", why: "list your characters by name when assigning models" }
 ];
 function el(tag, className, text) {
@@ -1650,6 +1796,7 @@ class SettingsUI {
   controller;
   root = null;
   selectedCharacterId = null;
+  lastActiveCharacterId = null;
   selectedModelId = null;
   libraryFilter = "";
   libraryList = null;
@@ -1776,17 +1923,32 @@ class SettingsUI {
     }), importStatus));
     library.appendChild(note("Zip the model folder (the *.model3.json or *.model.json file plus textures, motions and expressions). " + "A sillytavern_settings.json preset in the folder is applied automatically. " + "A model's thumbnail is taken the first time it's shown."));
     root.appendChild(section("Model library", library));
-    const characters = [...controller.getCharacters()];
+    const known = controller.getCharacters();
     const activeCharacterId = controller.getActiveCharacterId();
-    if (activeCharacterId && !characters.some((character) => character.id === activeCharacterId)) {
-      characters.unshift({ id: activeCharacterId, name: "Current chat character" });
+    const inChat = controller.stage.getChatContext().characterIds;
+    if (activeCharacterId && !inChat.includes(activeCharacterId))
+      inChat.unshift(activeCharacterId);
+    const isGroup = inChat.length > 1;
+    const characters = [
+      ...inChat.map((id, index) => {
+        const name = known.find((character) => character.id === id)?.name;
+        const fallback = isGroup ? `Group member ${index + 1}` : "Current chat character";
+        return { id, name: `${name ?? fallback} (in this chat)` };
+      }),
+      ...known.filter((character) => !inChat.includes(character.id))
+    ];
+    if (activeCharacterId !== this.lastActiveCharacterId) {
+      if (activeCharacterId && (!this.selectedCharacterId || this.selectedCharacterId === this.lastActiveCharacterId)) {
+        this.selectedCharacterId = activeCharacterId;
+      }
+      this.lastActiveCharacterId = activeCharacterId;
     }
-    if (!this.selectedCharacterId && activeCharacterId)
-      this.selectedCharacterId = activeCharacterId;
-    if (!this.selectedCharacterId && characters.length > 0)
-      this.selectedCharacterId = characters[0].id;
+    if (!characters.some((character) => character.id === this.selectedCharacterId)) {
+      this.selectedCharacterId = activeCharacterId ?? characters[0]?.id ?? null;
+    }
     const bindingSection = el("div");
     if (characters.length === 0) {
+      this.selectedModelId = null;
       bindingSection.appendChild(note('Open a chat (or grant the "characters" permission) to assign a model to a character.'));
     } else {
       const characterSelect = this.picker(characters.map((character) => ({
@@ -1818,12 +1980,16 @@ class SettingsUI {
         else
           settings.characterModelMapping[characterId] = value;
         controller.saveNow();
-        controller.reloadStage();
+        if (this.isOnStage(characterId))
+          controller.reloadStage();
         this.render();
       }, { placeholder: "No model", searchPlaceholder: "Search models…", noneLabel: "No model" });
       bindingSection.appendChild(row("Character", characterSelect));
       bindingSection.appendChild(row("Model", modelSelect));
-      const characterName = () => characters.find((character) => character.id === this.selectedCharacterId)?.name ?? "Character";
+      if (isGroup) {
+        bindingSection.appendChild(note("Group chat: every member with a model is shown. The stage is split into equal columns, one per " + "member with a model (Live2D or, with the Spine Avatars extension, Spine), in member order. " + "Scale 1 fits the model in its column; X and Y offset and Fit to canvas work within that column."));
+      }
+      const characterName = () => characters.find((character) => character.id === this.selectedCharacterId)?.name.replace(/ \(in this chat\)$/, "") ?? "Character";
       const fileStatus = el("span", "l2d-dim", this.fileStatusText);
       const exportButton = button("Export settings", () => {
         if (this.selectedCharacterId)
@@ -1851,7 +2017,8 @@ class SettingsUI {
           return;
         delete settings.characterModelsSettings[characterId];
         controller.saveNow();
-        controller.reloadStage();
+        if (this.isOnStage(characterId))
+          controller.reloadStage();
         this.render();
       })));
     }
@@ -1984,15 +2151,19 @@ Used by ${used} character${used === 1 ? "" : "s"}` : ""}`;
     });
     return host;
   }
+  isOnStage(characterId) {
+    return this.controller.stage.getChatContext().characterIds.includes(characterId);
+  }
   renderModelSettings(host, characterId, modelId, description) {
     const controller = this.controller;
     const modelSettings = controller.getOrCreateModelSettings(characterId, modelId, description);
     const applyLive = () => {
-      const current = controller.stage.currentModel();
-      if (current && current.characterId === characterId && current.modelId === modelId) {
-        controller.stage.applyLayout();
-        controller.stage.applyCursorParams();
-      }
+      if (controller.stage.isOnStage(characterId, modelId))
+        controller.stage.applyLayoutFor(characterId);
+    };
+    const play = (mapping) => {
+      controller.stage.playExpression(characterId, mapping.expression);
+      controller.stage.playMotion(characterId, mapping.motion, true);
     };
     const scaleSlider = slider("Scale", 0.05, 3, 0.01, modelSettings.scale, (value) => {
       modelSettings.scale = value;
@@ -2017,7 +2188,7 @@ Used by ${used} character${used === 1 ? "" : "s"}` : ""}`;
     };
     const fitHint = el("span", "l2d-dim", "");
     host.appendChild(row(button("Fit to canvas", () => {
-      const fit = controller.stage.fitScale(description, modelSettings.rotation || 0);
+      const fit = controller.stage.fitScale(characterId, modelId, modelSettings.rotation || 0);
       if (fit === null) {
         fitHint.textContent = "Show the model first, then try again.";
         return;
@@ -2033,7 +2204,7 @@ Used by ${used} character${used === 1 ? "" : "s"}` : ""}`;
       controller.saveDebounced();
       applyLive();
     }), button("Update thumbnail", () => {
-      fitHint.textContent = controller.updateThumbnail(modelId) ? "Thumbnail updated." : "Show the model first, then try again.";
+      fitHint.textContent = controller.updateThumbnail(characterId, modelId) ? "Thumbnail updated." : "Show the model first, then try again.";
     }), fitHint));
     host.appendChild(scaleSlider);
     host.appendChild(xSlider);
@@ -2078,15 +2249,15 @@ Used by ${used} character${used === 1 ? "" : "s"}` : ""}`;
     cursor.appendChild(note("Auto-detected on first load when the model uses standard parameter names."));
     host.appendChild(section("Cursor tracking parameters", cursor));
     const animations = el("div");
-    animations.appendChild(this.animationRow("Starter", description, modelSettings.animation_starter, true));
-    const defaultRow = this.animationRow("Default", description, modelSettings.animation_default, false);
+    animations.appendChild(this.animationRow("Starter", characterId, description, modelSettings.animation_starter, true));
+    const defaultRow = this.animationRow("Default", characterId, description, modelSettings.animation_default, false);
     defaultRow.appendChild(checkbox("Loop the default animation", modelSettings.animation_default.loop, (value) => {
       modelSettings.animation_default.loop = value;
       controller.saveDebounced();
     }));
     defaultRow.appendChild(note("When looping, the default motion replaces the model’s idle motion and the default expression stays on. " + "Starter, click and emotion animations play once, then the default comes back."));
     animations.appendChild(defaultRow);
-    const clickRow = this.animationRow("On click", description, modelSettings.animation_click, false);
+    const clickRow = this.animationRow("On click", characterId, description, modelSettings.animation_click, false);
     const clickMessage = el("input", "l2d-input");
     clickMessage.type = "text";
     clickMessage.placeholder = "Message sent when clicked (optional)";
@@ -2107,10 +2278,7 @@ Used by ${used} character${used === 1 ? "" : "s"}` : ""}`;
       }), select(motionOptions(description), mapping.motion, (value) => {
         mapping.motion = value;
         controller.saveDebounced();
-      }), button("▶", () => {
-        controller.stage.playExpression(mapping.expression);
-        controller.stage.playMotion(mapping.motion, true);
-      })));
+      }), button("▶", () => play(mapping))));
     }
     const classifySection = section("Emotion mappings", classify);
     classifySection.open = false;
@@ -2137,17 +2305,14 @@ Used by ${used} character${used === 1 ? "" : "s"}` : ""}`;
         }), select(motionOptions(description), mapping.motion, (value) => {
           mapping.motion = value;
           controller.saveDebounced();
-        }), message, button("▶", () => {
-          controller.stage.playExpression(mapping.expression);
-          controller.stage.playMotion(mapping.motion, true);
-        })));
+        }), message, button("▶", () => play(mapping))));
       }
       const hitSection = section("Hit areas", hitAreas);
       hitSection.open = false;
       host.appendChild(hitSection);
     }
   }
-  animationRow(label, description, mapping, withDelay) {
+  animationRow(label, characterId, description, mapping, withDelay) {
     const controller = this.controller;
     const wrap = el("div", "l2d-anim");
     wrap.appendChild(el("div", "l2d-anim-title", label));
@@ -2158,8 +2323,8 @@ Used by ${used} character${used === 1 ? "" : "s"}` : ""}`;
       mapping.motion = value;
       controller.saveDebounced();
     }), button("▶", () => {
-      controller.stage.playExpression(mapping.expression);
-      controller.stage.playMotion(mapping.motion, true);
+      controller.stage.playExpression(characterId, mapping.expression);
+      controller.stage.playMotion(characterId, mapping.motion, true);
     })));
     if (withDelay) {
       wrap.appendChild(slider("Delay before starter (ms)", 0, 1e4, 100, mapping.delay ?? 0, (value) => {
@@ -2394,7 +2559,8 @@ function setup(ctx) {
     getModelSettings: getOrCreateModelSettings,
     saveSettingsDebounced: saveDebounced,
     assets,
-    sendInteraction: (message) => {
+    drawsOverApp: () => overlayActive,
+    sendInteraction: (message, characterId) => {
       const { chatId } = stage.getChatContext();
       if (!chatId)
         return;
@@ -2402,7 +2568,8 @@ function setup(ctx) {
         type: "interaction",
         chatId,
         message,
-        generate: settings.global.autoSendInteraction
+        generate: settings.global.autoSendInteraction,
+        characterId
       });
     },
     saveThumbnail: (modelId, dataUrl) => {
@@ -2607,10 +2774,10 @@ function setup(ctx) {
       stage.reload();
       return `Imported settings for "${record.name}".`;
     },
-    updateThumbnail: (modelId) => {
-      if (stage.currentModel()?.modelId !== modelId)
+    updateThumbnail: (characterId, modelId) => {
+      if (!stage.isOnStage(characterId, modelId))
         return false;
-      const dataUrl = stage.captureThumbnail();
+      const dataUrl = stage.captureThumbnail(characterId);
       if (!dataUrl)
         return false;
       models = models.map((model) => model.id === modelId ? { ...model, thumbnail: dataUrl } : model);
@@ -2641,16 +2808,32 @@ function setup(ctx) {
     unsubAction();
     inputAction.destroy();
   });
+  const followActiveChat = () => {
+    const active = ctx.getActiveChat();
+    if (stage.getChatContext().chatId !== active.chatId) {
+      const own = active.characterId && !permissions.includes("chats") ? [active.characterId] : [];
+      stage.setChatContext(active.chatId, own);
+    }
+    if (active.chatId)
+      ctx.sendToBackend({ type: "get_chat_context", chatId: active.chatId });
+  };
+  const stageCharacterFor = (chatId, characterId) => {
+    const context = stage.getChatContext();
+    if (!context.chatId || chatId !== context.chatId)
+      return null;
+    const onStage = stage.charactersOnStage();
+    if (characterId)
+      return onStage.includes(characterId) ? characterId : null;
+    return onStage.length === 1 ? onStage[0] : null;
+  };
   const playMappedExpression = (msg) => {
-    const { chatId, characterId } = stage.getChatContext();
-    if (!chatId || msg.chatId !== chatId)
+    const characterId = stageCharacterFor(msg.chatId, msg.characterId);
+    if (!characterId)
       return;
-    if (msg.characterId && characterId && msg.characterId !== characterId)
+    const modelId = settings.characterModelMapping[characterId];
+    if (!modelId)
       return;
-    const current = stage.currentModel();
-    if (!current)
-      return;
-    const modelSettings = getOrCreateModelSettings(current.characterId, current.modelId, stage.getDescription());
+    const modelSettings = getOrCreateModelSettings(characterId, modelId, stage.getDescription(characterId));
     const mapping = modelSettings.classify_mapping[msg.label] ?? { expression: "none", motion: "none" };
     let expression = mapping.expression;
     let motion = mapping.motion;
@@ -2659,9 +2842,9 @@ function setup(ctx) {
     if (motion === "none")
       motion = modelSettings.animation_default.motion;
     if (expression !== "none")
-      stage.playExpression(expression);
+      stage.playExpression(characterId, expression);
     if (motion !== "none")
-      stage.playMotion(motion);
+      stage.playMotion(characterId, motion);
   };
   const unsubBackend = ctx.onBackendMessage((payload) => {
     const msg = payload;
@@ -2675,8 +2858,7 @@ function setup(ctx) {
         permissions = msg.permissions;
         stateReceived = true;
         ensureStageHost();
-        const active = ctx.getActiveChat();
-        stage.setChatContext(active.chatId, active.characterId);
+        followActiveChat();
         ui.render();
         break;
       }
@@ -2714,16 +2896,25 @@ function setup(ctx) {
         playMappedExpression(msg);
         break;
       case "character_message": {
-        const { chatId, characterId } = stage.getChatContext();
-        if (!chatId || msg.chatId !== chatId || msg.textLength === 0)
-          break;
-        if (msg.characterId && characterId && msg.characterId !== characterId)
-          break;
-        stage.playTalk(msg.textLength);
+        const characterId = stageCharacterFor(msg.chatId, msg.characterId);
+        if (characterId && msg.textLength > 0)
+          stage.playTalk(characterId, msg.textLength);
         break;
       }
-      case "chat_context":
-        stage.setChatContext(msg.chatId, msg.characterId ?? ctx.getActiveChat().characterId);
+      case "chat_context": {
+        const active = ctx.getActiveChat();
+        if (msg.chatId !== active.chatId)
+          break;
+        const fallback = active.characterId ? [active.characterId] : [];
+        stage.setChatContext(msg.chatId, msg.characterIds?.length ? msg.characterIds : fallback);
+        ui.render();
+        break;
+      }
+      case "chat_members":
+        if (msg.chatId !== stage.getChatContext().chatId)
+          break;
+        stage.setChatContext(msg.chatId, msg.characterIds);
+        ui.render();
         break;
       case "classify_test_result":
         if (classifyPending) {
@@ -2738,6 +2929,7 @@ function setup(ctx) {
       case "permissions_changed":
         permissions = msg.permissions;
         ensureStageHost();
+        followActiveChat();
         ui.render();
         break;
       case "focus_tab":
@@ -2757,8 +2949,8 @@ function setup(ctx) {
   cleanups.push(unsubBackend);
   const unsubChat = ctx.events.on("CHAT_SWITCHED", () => {
     window.setTimeout(() => {
-      const active = ctx.getActiveChat();
-      stage.setChatContext(active.chatId, active.characterId);
+      followActiveChat();
+      ui.render();
     }, 50);
   });
   cleanups.push(unsubChat);

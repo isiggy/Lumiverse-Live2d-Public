@@ -12,6 +12,11 @@
 //   lumiverse.sh e2e --keep-open  # also leave a screenshot with the Live2D tab open
 //   lumiverse.sh e2e --library    # then test the model library (thumbnails, sorting, filter,
 //                                 # tiles and list), dropdown search, and settings file export/import
+//   lumiverse.sh e2e --group      # a four-member group chat instead: every member's model is drawn
+//                                 # in its own column, a drag moves only one model, and removing a
+//                                 # member re-lays the stage out. With --spine-model, every other
+//                                 # member gets a Spine model (Spine Avatars must be deployed too)
+//                                 # and both extensions share the columns
 //   (--model and --slow are handled by lumiverse.sh)
 
 import { createRequire } from 'node:module';
@@ -24,6 +29,12 @@ const CHAT = `${BASE}/chat/${process.env.LUMI_CHAT_ID}`;
 const OUT = process.env.LUMI_OUT;
 const keepOpen = process.argv.includes('--keep-open');
 const testLibrary = process.argv.includes('--library');
+const group = process.argv.includes('--group');
+const lines = (value) => (value || '').split('\n').filter(Boolean);
+const MODEL_ZIPS = lines(process.env.LUMI_MODEL_ZIPS || process.env.LUMI_MODEL_ZIP);
+const SPINE_ZIPS = lines(process.env.LUMI_SPINE_ZIPS);
+const GROUP_CHAT_ID = process.env.LUMI_GROUP_CHAT_ID;
+const GROUP_MEMBERS = lines(process.env.LUMI_GROUP_MEMBERS);
 // The extension names an imported model after its zip file.
 const MODEL_NAME = path.basename(process.env.LUMI_MODEL_ZIP).replace(/\.zip$/i, '');
 fs.mkdirSync(OUT, { recursive: true });
@@ -36,7 +47,7 @@ const page = await (await browser.newContext({ viewport: { width: 1440, height: 
 const problems = [];
 page.on('pageerror', (error) => problems.push(`page error: ${error.message}`));
 page.on('console', (msg) => {
-  if (msg.text().includes('[live2d]')) problems.push(`extension: ${msg.text()}`);
+  if (msg.text().includes('[live2d]') || msg.text().includes('[spine]')) problems.push(`extension: ${msg.text()}`);
 });
 
 async function openLive2DTab() {
@@ -291,12 +302,375 @@ async function libraryTest() {
   await page.waitForTimeout(1000);
 }
 
+// ── Group chats ─────────────────────────────────────────────────────────────
+
+const modelName = (zip) => path.basename(zip).replace(/\.zip$/i, '');
+
+/** One of the avatar extensions' settings tabs, by the prefix of its class names. */
+const EXTENSIONS = {
+  live2d: { tab: 'Live2D', prefix: 'l2d', canvas: '.live2d-avatars-canvas' },
+  spine: { tab: 'Spine', prefix: 'spn', canvas: '.spine-avatars-canvas' },
+};
+
+async function openTab(ext) {
+  await page.evaluate((label) => {
+    const node = [...document.querySelectorAll('span,button,div')].find(
+      (candidate) => candidate.textContent === label && candidate.children.length === 0,
+    );
+    (node?.closest('button') ?? node)?.click();
+  }, ext.tab);
+  await page.waitForFunction((root) => document.querySelector(root)?.getBoundingClientRect().width > 0, `.${ext.prefix}-root`, {
+    timeout: 30000,
+  });
+}
+
+/** An option's label: its first line that isn't a one-letter initial. */
+function optionLabel(text) {
+  return text.split('\n').map((line) => line.trim()).find((line) => line.length > 1) ?? '';
+}
+
+function pickersOf(ext) {
+  return page.locator(
+    `.${ext.prefix}-section:has(> .${ext.prefix}-section-title:text-is("Character model")) .${ext.prefix}-picker`,
+  );
+}
+
+/** Choose the option whose label is one of `labels`, searching first when the dropdown has a search field. */
+async function pickOption(picker, labels, searchLabel) {
+  await picker.locator('button').first().click();
+  await page.waitForSelector('[role="listbox"]');
+  const search = page.locator(`input[aria-label="${searchLabel}"]`);
+  if (await search.isVisible().catch(() => false)) await search.fill(labels[0]);
+  const options = (await page.locator('[role="listbox"] [role="option"]').allInnerTexts()).map(optionLabel);
+  const index = options.findIndex((option) => labels.includes(option));
+  if (index === -1) {
+    await page.keyboard.press('Escape');
+    throw new Error(`${labels[0]} missing from the dropdown (${options.join(', ')})`);
+  }
+  await page.locator('[role="listbox"] [role="option"]').nth(index).click();
+  await page.waitForTimeout(400);
+}
+
+async function characterName(characterId) {
+  return page.evaluate(
+    (id) => fetch(`/api/v1/characters/${id}`).then((response) => response.json()).then((c) => c.name),
+    characterId,
+  );
+}
+
+async function selectCharacterIn(ext, characterId) {
+  const name = await characterName(characterId);
+  const labels = [name, `${name} (in this chat)`];
+  const picker = pickersOf(ext).nth(0);
+  if (!labels.includes(optionLabel(await picker.innerText()))) await pickOption(picker, labels, 'Search characters…');
+  return optionLabel(await pickersOf(ext).nth(0).innerText());
+}
+
+/** Bind `name` (or no model, for null) to the selected character. */
+async function bindIn(ext, name) {
+  const picker = pickersOf(ext).nth(1);
+  const label = name ?? 'No model';
+  if (optionLabel(await picker.innerText()) !== label) await pickOption(picker, [label], 'Search models…');
+}
+
+async function importInto(ext, zip) {
+  const name = modelName(zip);
+  const inLibrary = ({ prefix, name }) =>
+    [...document.querySelectorAll(`.${prefix}-model-name, .${prefix}-tile-name`)].some((node) => node.textContent === name);
+  if (await page.evaluate(inLibrary, { prefix: ext.prefix, name })) return;
+  console.log(`Importing ${name} into ${ext.tab}…`);
+  const [chooser] = await Promise.all([
+    page.waitForEvent('filechooser', { timeout: 15000 }),
+    page.click(`.${ext.prefix}-root button:has-text("Import model")`),
+  ]);
+  await chooser.setFiles(zip);
+  await page.waitForFunction(inLibrary, { prefix: ext.prefix, name }, { timeout: 300000 });
+}
+
+async function clickIn(ext, text) {
+  // Model settings show once the model's files are downloaded, which takes a while for big models.
+  await page.waitForSelector(`.${ext.prefix}-root button:text-is("${text}")`, { timeout: 600000 });
+  await page.click(`.${ext.prefix}-root button:text-is("${text}")`);
+  await page.waitForTimeout(400);
+}
+
+/** Per column of an extension's canvases (Live2D has one per model): the share of pixels drawn and the drawn box. */
+async function columnInfo(ext, columns) {
+  return page.evaluate(
+    ({ selector, columns }) =>
+      new Promise((resolve) => {
+        const canvases = [...document.querySelectorAll(selector)];
+        if (canvases.length === 0) return resolve(null);
+        const rect = canvases[0].getBoundingClientRect();
+        const scale = 0.25;
+        const probe = document.createElement('canvas');
+        probe.width = Math.max(1, Math.round(rect.width * scale));
+        probe.height = Math.max(1, Math.round(rect.height * scale));
+        const context = probe.getContext('2d', { willReadFrequently: true });
+        requestAnimationFrame(() => {
+          for (const canvas of canvases) context.drawImage(canvas, 0, 0, probe.width, probe.height);
+          const data = context.getImageData(0, 0, probe.width, probe.height).data;
+          const columnWidth = probe.width / columns;
+          const result = [];
+          for (let column = 0; column < columns; column++) {
+            const x0 = Math.round(column * columnWidth);
+            const x1 = Math.round((column + 1) * columnWidth);
+            let drawn = 0;
+            let minX = Infinity;
+            let maxX = -Infinity;
+            let minY = Infinity;
+            let maxY = -Infinity;
+            for (let y = 0; y < probe.height; y++) {
+              for (let x = x0; x < x1; x++) {
+                if (data[(y * probe.width + x) * 4 + 3] > 16) {
+                  drawn++;
+                  minX = Math.min(minX, x);
+                  maxX = Math.max(maxX, x);
+                  minY = Math.min(minY, y);
+                  maxY = Math.max(maxY, y);
+                }
+              }
+            }
+            result.push({
+              drawn: +(drawn / ((x1 - x0) * probe.height)).toFixed(3),
+              box: drawn
+                ? {
+                    x: Math.round(minX / scale),
+                    y: Math.round(minY / scale),
+                    width: Math.round((maxX - minX + 1) / scale),
+                    height: Math.round((maxY - minY + 1) / scale),
+                  }
+                : null,
+            });
+          }
+          resolve({ width: Math.round(rect.width), columns: result });
+        });
+      }),
+    { selector: ext.canvas, columns },
+  );
+}
+
+const center = (box) => (box ? box.x + box.width / 2 : NaN);
+
+/** Wait until every member's model is drawn somewhere in its column (big models take a while to arrive). */
+async function waitForModels(owners) {
+  const deadline = Date.now() + 600000;
+  while (Date.now() < deadline) {
+    const used = [...new Set(owners)];
+    const infos = Object.fromEntries(
+      await Promise.all(used.map(async (key) => [key, await columnInfo(EXTENSIONS[key], owners.length)])),
+    );
+    if (owners.every((owner, index) => (infos[owner]?.columns[index]?.drawn ?? 0) > 0.01)) return;
+    await page.waitForTimeout(3000);
+  }
+  console.log('Some models still missing after 10 minutes');
+}
+
+/**
+ * Check that each member's model is drawn in its own column on the canvas of
+ * the extension it belongs to, and nothing of it spills into the others' columns.
+ */
+async function checkColumns(owners, what) {
+  const count = owners.length;
+  const used = [...new Set(owners)];
+  const infos = Object.fromEntries(await Promise.all(used.map(async (key) => [key, await columnInfo(EXTENSIONS[key], count)])));
+  for (const key of used) {
+    console.log(`${EXTENSIONS[key].tab} canvas columns (${what}): ${JSON.stringify(infos[key]?.columns.map((c) => c.drawn))}`);
+  }
+  owners.forEach((owner, index) => {
+    const info = infos[owner];
+    const column = info?.columns[index];
+    const width = info ? info.width / count : 0;
+    const x = center(column?.box);
+    check(
+      column && column.drawn > 0.01 && x > index * width && x < (index + 1) * width,
+      `${what}: member ${index + 1}'s ${EXTENSIONS[owner].tab} model is drawn in column ${index + 1} of ${count} ` +
+        `(${((column?.drawn ?? 0) * 100).toFixed(1)}% drawn, center x ${Math.round(x)})`,
+    );
+    for (const other of used) {
+      if (other === owner) continue;
+      const stray = infos[other]?.columns[index]?.drawn ?? 0;
+      check(stray < 0.005, `${what}: the ${EXTENSIONS[other].tab} canvas leaves column ${index + 1} empty (${(stray * 100).toFixed(1)}%)`);
+    }
+  });
+  return infos;
+}
+
+async function runGroup() {
+  console.log('── Group chat ──');
+  const members = GROUP_MEMBERS;
+  if (members.length < 2 || !GROUP_CHAT_ID) throw new Error('No group chat members; run lumiverse.sh seed-group');
+  const groupChat = `${BASE}/chat/${GROUP_CHAT_ID}`;
+  const live2d = EXTENSIONS.live2d;
+  const spine = EXTENSIONS.spine;
+  const mixed = SPINE_ZIPS.length > 0;
+  // Members take Live2D models in turn; with Spine models, every other member takes a Spine one.
+  const owners = members.map((_, index) => (mixed && index % 2 === 1 ? 'spine' : 'live2d'));
+  const models = owners.map((owner, index) => {
+    const zips = owner === 'spine' ? SPINE_ZIPS : MODEL_ZIPS;
+    const turn = mixed ? Math.floor(index / 2) : index;
+    return zips[turn % zips.length];
+  });
+
+  await page.goto(groupChat);
+  await page.waitForTimeout(5000);
+  await openTab(live2d);
+  for (const zip of MODEL_ZIPS) await importInto(live2d, zip);
+  if (mixed) {
+    await openTab(spine);
+    for (const zip of SPINE_ZIPS) await importInto(spine, zip);
+  }
+
+  // Each member gets a model in its extension and none in the other, then is fitted to its column.
+  for (const [index, characterId] of members.entries()) {
+    const owner = EXTENSIONS[owners[index]];
+    if (mixed) {
+      const other = owner === live2d ? spine : live2d;
+      await openTab(other);
+      await selectCharacterIn(other, characterId);
+      await bindIn(other, null);
+    }
+    await openTab(owner);
+    const label = await selectCharacterIn(owner, characterId);
+    await bindIn(owner, modelName(models[index]));
+    console.log(`bound ${owner.tab} model ${modelName(models[index])} to ${label}`);
+  }
+  if (mixed) await openTab(live2d);
+  const labels = await page
+    .locator('.l2d-section:has(> .l2d-section-title:text-is("Character model")) .l2d-picker')
+    .nth(0)
+    .locator('button')
+    .first()
+    .click()
+    .then(() => page.locator('[role="listbox"] [role="option"]').allInnerTexts())
+    .then((texts) => texts.map(optionLabel));
+  await page.keyboard.press('Escape');
+  check(
+    labels.slice(0, members.length).every((label) => label.endsWith('(in this chat)')),
+    `group members listed first in the Live2D character picker: ${labels.slice(0, members.length).join(', ')}`,
+  );
+
+  // Reload so the stage is built from scratch, then fit every model to its column.
+  await page.goto(groupChat);
+  await page.waitForTimeout(3000);
+  await waitForModels(owners);
+  for (const [index, characterId] of members.entries()) {
+    const owner = EXTENSIONS[owners[index]];
+    await openTab(owner);
+    await selectCharacterIn(owner, characterId);
+    await clickIn(owner, 'Fit to canvas');
+  }
+  // Close the drawer so the whole stage shows.
+  await page.keyboard.press('Escape');
+  await page.goto(groupChat);
+  await page.waitForTimeout(3000);
+  await waitForModels(owners);
+  await page.waitForTimeout(3000);
+  await page.screenshot({ path: `${OUT}/group-chat.png` });
+  const before = await checkColumns(owners, 'group chat');
+
+  // Dragging the first member's model moves only it.
+  const first = before.live2d.columns[0].box;
+  const second = before[owners[1]].columns[1].box;
+  const grabX = center(first);
+  const grabY = first.y + first.height * 0.4;
+  await page.mouse.move(grabX, grabY);
+  await page.mouse.down();
+  await page.mouse.move(grabX + 20, grabY, { steps: 5 });
+  await page.mouse.move(grabX + 40, grabY + 20, { steps: 5 });
+  await page.mouse.up();
+  await page.waitForTimeout(800);
+  const afterLive2D = await columnInfo(live2d, members.length);
+  const afterSecond = await columnInfo(EXTENSIONS[owners[1]], members.length);
+  const shift = center(afterLive2D.columns[0].box) - center(first);
+  const otherShift = Math.abs(center(afterSecond.columns[1].box) - center(second));
+  check(
+    Math.abs(shift - 40) < 15 && otherShift < 15,
+    `a drag moves member 1's model about 40px (${Math.round(shift)}px) and leaves member 2's (${Math.round(otherShift)}px)`,
+  );
+  await page.screenshot({ path: `${OUT}/group-dragged.png` });
+  await openTab(live2d);
+  await selectCharacterIn(live2d, members[0]);
+  const draggedX = await sliderValue('X offset (%)');
+  const columnWidth = afterLive2D.width / members.length;
+  const expectedX = (shift / (columnWidth / 2)) * 100;
+  check(
+    Math.abs(draggedX - expectedX) < 3,
+    `member 1's X offset is relative to its column: ${draggedX}% (expected about ${expectedX.toFixed(1)}%)`,
+  );
+  await clickIn(live2d, 'Fit to canvas');
+  await page.keyboard.press('Escape');
+
+  // Removing a member re-lays out the stage without a reload, in both extensions.
+  const removedIndex = 1;
+  const removed = members[removedIndex];
+  const removeStatus = await page.evaluate(
+    async ({ chatId, characterId }) =>
+      (await fetch(`/api/v1/chats/${chatId}/members/${characterId}`, { method: 'DELETE' })).status,
+    { chatId: GROUP_CHAT_ID, characterId: removed },
+  );
+  check(removeStatus < 300, `removed member ${removedIndex + 1} (HTTP ${removeStatus})`);
+  await page.waitForTimeout(5000);
+  await page.screenshot({ path: `${OUT}/group-member-removed.png` });
+  await checkColumns(owners.filter((_, index) => index !== removedIndex), 'after removing a member');
+
+  // Put the member back for the next run (it rejoins at the end).
+  await page.evaluate(
+    async ({ chatId, characterId }) =>
+      fetch(`/api/v1/chats/${chatId}/members/${characterId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ skip_greeting: true }),
+      }),
+    { chatId: GROUP_CHAT_ID, characterId: removed },
+  );
+  await page.waitForTimeout(5000);
+  const rejoined = [...owners.filter((_, index) => index !== removedIndex), owners[removedIndex]];
+  await page.screenshot({ path: `${OUT}/group-member-added.png` });
+  await checkColumns(rejoined, 'after adding the member back');
+  // Restore the original member order for the next run.
+  await page.evaluate(
+    async ({ chatId, members }) => {
+      const chat = await fetch(`/api/v1/chats/${chatId}`).then((response) => response.json());
+      await fetch(`/api/v1/chats/${chatId}/metadata`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...chat.metadata, character_ids: members }),
+      });
+    },
+    { chatId: GROUP_CHAT_ID, members },
+  );
+
+  if (mixed) {
+    // With Spine turned off, its members' columns go away and the Live2D models share the stage.
+    await openTab(spine);
+    await page.locator('.spn-root label:has-text("Enabled") input[type="checkbox"]').first().uncheck();
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(3000);
+    await page.screenshot({ path: `${OUT}/group-spine-off.png` });
+    await checkColumns(owners.filter((owner) => owner === 'live2d'), 'with Spine turned off');
+    await openTab(spine);
+    await page.locator('.spn-root label:has-text("Enabled") input[type="checkbox"]').first().check();
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(5000);
+    await checkColumns(owners, 'with Spine back on');
+  }
+}
+
 try {
   await page.goto(BASE);
   await page.fill('input[type="text"]', process.env.LUMI_USER);
   await page.fill('input[type="password"]', process.env.LUMI_PASS);
   await page.click('button[type="submit"]');
   await page.waitForTimeout(4000);
+
+  if (group) {
+    await runGroup();
+    console.log(`Screenshots: ${OUT}`);
+    for (const problem of problems) console.log(problem);
+    console.log(process.exitCode ? 'FAIL: some group chat checks failed' : 'OK: group chat checks passed');
+    process.exit();
+  }
 
   await page.goto(CHAT);
   await page.waitForTimeout(5000);

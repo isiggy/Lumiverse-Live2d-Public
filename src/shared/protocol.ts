@@ -56,11 +56,19 @@ export interface InteractionMsg {
   message: string;
   /** Trigger a normal reply generation after appending (Auto-send interaction). */
   generate: boolean;
+  /** The character whose model was clicked; in a group chat, they reply. */
+  characterId?: string;
 }
 
 export interface ClassifyTestMsg {
   type: 'classify_test';
   text: string;
+}
+
+/** Ask which characters are in a chat; answered with `chat_context`. */
+export interface GetChatContextMsg {
+  type: 'get_chat_context';
+  chatId: string;
 }
 
 export type FrontendToBackend =
@@ -72,7 +80,8 @@ export type FrontendToBackend =
   | GetModelManifestMsg
   | GetModelChunkMsg
   | InteractionMsg
-  | ClassifyTestMsg;
+  | ClassifyTestMsg
+  | GetChatContextMsg;
 
 // ── Backend → Frontend ──────────────────────────────────────────────────────
 
@@ -157,7 +166,20 @@ export interface CharacterMessageMsg {
 export interface ChatContextMsg {
   type: 'chat_context';
   chatId: string | null;
+  /** The chat's own character (a group chat's first member). */
   characterId: string | null;
+  /**
+   * Every character in the chat, in member order: one for a solo chat, all
+   * members for a group chat. null when the backend can't read the chat.
+   */
+  characterIds: string[] | null;
+}
+
+/** A chat's group members changed (added, removed or reordered). */
+export interface ChatMembersMsg {
+  type: 'chat_members';
+  chatId: string;
+  characterIds: string[];
 }
 
 export interface ClassifyTestResultMsg {
@@ -197,6 +219,7 @@ export type BackendToFrontend =
   | ExpressionMsg
   | CharacterMessageMsg
   | ChatContextMsg
+  | ChatMembersMsg
   | ClassifyTestResultMsg
   | PermissionsChangedMsg
   | FocusTabMsg

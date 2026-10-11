@@ -5,9 +5,14 @@
 #   scripts/dev/lumiverse.sh start    # start the server in the background, wait until it answers
 #   scripts/dev/lumiverse.sh deploy   # build this extension, install/update it, grant permissions, enable
 #   scripts/dev/lumiverse.sh seed     # create a "Haru" character + chat, print the chat URL
+#   scripts/dev/lumiverse.sh seed-group  # create a group chat of four "Live2D Group" characters
 #   scripts/dev/lumiverse.sh models   # download the Haru (Cubism 4) and Shizuku (Cubism 2) test model zips
 #   scripts/dev/lumiverse.sh e2e      # headless browser: log in, import + bind Haru, open the chat, screenshot
 #        [--model path.zip]           #   test this model instead of Haru
+#        [--group]                    #   test a four-member group chat instead; --model can be
+#                                     #   repeated, members get the models in turn
+#        [--spine-model path.zip]     #   with --group: every other member gets a Spine model
+#                                     #   (repeatable; deploy the Spine Avatars extension first)
 #        [--slow]                     #   go through a 3 MB/s proxy, like a remote browser
 #   scripts/dev/lumiverse.sh stop | status | logs
 #
@@ -216,6 +221,36 @@ cmd_seed() {
   log "Chat: $BASE/chat/$chat_id"
 }
 
+# A group chat of "Live2D Group 1" to "Live2D Group 4".
+cmd_seed_group() {
+  [[ -f "$WORK/chat-id" ]] || cmd_seed
+  login
+  local ids=() name id chat_id
+  for name in "Live2D Group 1" "Live2D Group 2" "Live2D Group 3" "Live2D Group 4"; do
+    id="$(api GET '/api/v1/characters?limit=200' | json "const c=(d.data??d).find(x=>x.name==='$name'); console.log(c?c.id:'')")"
+    if [[ -z "$id" ]]; then
+      id="$(api POST /api/v1/characters "{\"name\":\"$name\",\"description\":\"Live2D test character\",\"first_mes\":\"Hello from $name!\"}" | json 'console.log(d.id)')"
+      log "Created character $name ($id)"
+    fi
+    ids+=("$id")
+  done
+  local members
+  members="$(printf '"%s",' "${ids[@]}")"
+  members="[${members%,}]"
+  # Reuse the group chat from last time while it still has these members.
+  chat_id="$(cat "$WORK/live2d-group-chat-id" 2>/dev/null || true)"
+  if [[ -n "$chat_id" ]]; then
+    chat_id="$(api GET "/api/v1/chats/$chat_id" | json "console.log(JSON.stringify(d.metadata?.character_ids)===JSON.stringify($members) ? d.id : '')" 2>/dev/null || true)"
+  fi
+  if [[ -z "$chat_id" ]]; then
+    chat_id="$(api POST /api/v1/chats/group "{\"character_ids\":$members,\"name\":\"Live2D Group\"}" | json 'console.log(d.id)')"
+    log "Created group chat ($chat_id)"
+  fi
+  echo "$chat_id" >"$WORK/live2d-group-chat-id"
+  printf '%s\n' "${ids[@]}" >"$WORK/live2d-group-members"
+  log "Group chat: $BASE/chat/$chat_id"
+}
+
 cmd_models() {
   mkdir -p "$WORK/models"
   if [[ ! -d "$WORK/pixi-live2d-display" ]]; then
@@ -232,20 +267,24 @@ cmd_models() {
 
 cmd_e2e() {
   is_running || die "Server isn't running; run start first."
-  local model_zip="" slow=false extra=()
+  local model_zips=() spine_zips=() slow=false group=false extra=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --model) model_zip="$(realpath "$2")"; shift 2 ;;
+      --model) model_zips+=("$(realpath "$2")"); shift 2 ;;
+      --spine-model) spine_zips+=("$(realpath "$2")"); shift 2 ;;
       --slow) slow=true; shift ;;
+      --group) group=true; extra+=("$1"); shift ;;
       *) extra+=("$1"); shift ;;
     esac
   done
   [[ -f "$WORK/chat-id" ]] || cmd_seed
-  if [[ -z "$model_zip" ]]; then
+  if $group; then cmd_seed_group; fi
+  if [[ ${#model_zips[@]} -eq 0 ]]; then
     [[ -f "$WORK/models/haru.zip" ]] || cmd_models
-    model_zip="$WORK/models/haru.zip"
+    model_zips=("$WORK/models/haru.zip")
   fi
-  [[ -f "$model_zip" ]] || die "No such model zip: $model_zip"
+  local zip
+  for zip in "${model_zips[@]}" "${spine_zips[@]}"; do [[ -f "$zip" ]] || die "No such model zip: $zip"; done
   if [[ ! -d "$WORK/pw/node_modules/playwright" ]]; then
     log "Installing Playwright (uses the preinstalled Chromium)…"
     mkdir -p "$WORK/pw" && (cd "$WORK/pw" && npm init -y >/dev/null && npm install --silent playwright >/dev/null)
@@ -261,7 +300,11 @@ cmd_e2e() {
   fi
   local status=0
   PW_DIR="$WORK/pw" LUMI_BASE="$base" LUMI_USER="$USER_NAME" LUMI_PASS="$USER_PASS" \
-    LUMI_CHAT_ID="$(cat "$WORK/chat-id")" LUMI_MODEL_ZIP="$model_zip" LUMI_OUT="$WORK/shots" \
+    LUMI_CHAT_ID="$(cat "$WORK/chat-id")" LUMI_MODEL_ZIP="${model_zips[0]}" LUMI_OUT="$WORK/shots" \
+    LUMI_MODEL_ZIPS="$(printf '%s\n' "${model_zips[@]}")" \
+    LUMI_SPINE_ZIPS="$(printf '%s\n' "${spine_zips[@]}")" \
+    LUMI_GROUP_CHAT_ID="$(cat "$WORK/live2d-group-chat-id" 2>/dev/null || true)" \
+    LUMI_GROUP_MEMBERS="$(cat "$WORK/live2d-group-members" 2>/dev/null || true)" \
     node "$REPO/scripts/dev/e2e.mjs" "${extra[@]}" || status=$?
   [[ -n "$proxy_pid" ]] && kill "$proxy_pid" 2>/dev/null
   return "$status"
@@ -276,7 +319,8 @@ case "${1:-}" in
   logs) tail -n "${2:-50}" "$LOG" ;;
   deploy) cmd_deploy ;;
   seed) cmd_seed ;;
+  seed-group) cmd_seed_group ;;
   models) cmd_models ;;
   e2e) shift; cmd_e2e "$@" ;;
-  *) sed -n '2,16p' "$0"; exit 1 ;;
+  *) sed -n '2,21p' "$0"; exit 1 ;;
 esac

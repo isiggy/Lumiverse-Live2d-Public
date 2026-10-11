@@ -8,6 +8,7 @@ Supports **Cubism 2.1** (`*.model.json`) and **Cubism 3/4/5** (`*.model3.json`) 
 
 - **Model library** — import Live2D model folders as `.zip` archives straight from the browser. Files are stored in the extension's private storage and cached client-side (Cache Storage) for instant reloads. Shown as tiles with a thumbnail of each model (taken the first time it's shown; *Update thumbnail* under *Model settings* retakes it) or as a list, filtered by name and sorted by name, import date or size.
 - **Per-character bindings** — assign a model to each character; the avatar loads automatically when you open that character's chat. The character and model dropdowns have a search field once the list gets long.
+- **Group chats** — every member with a model is on stage at once. The stage is split into equal columns, one per member with a model, left to right in member order; each model's offsets and *Fit to canvas* work within its own column, and at scale 1 a model also keeps within its column's width (a solo chat's one column is the whole stage, as before). Talking, emotion and click animations play on the member they belong to, and clicking a member's model with *Auto-send interaction* on gets the reply from that member. Members joining or leaving re-lay the stage out. With the [Spine Avatars](https://github.com/isiggy/Lumiverse-Spine-Public) extension installed too, members can have a Live2D or a Spine model: the two extensions share the columns, so one group chat shows both kinds side by side.
 - **Settings files** — *Export settings* saves a character's model and animation settings for its model to a `.json` file; *Import settings* loads one onto the selected character, binding it to the file's model (found by id, then name). The file format is shared with the Spine Avatars extension, which refuses Live2D files and vice versa.
 - **Emotion-driven animation** — new character messages are classified into one of the classic 28 emotions (`joy`, `anger`, `surprise`, …) with a quiet LLM generation, and each emotion can be mapped to a model expression and/or motion. Alternatively reuse Lumiverse's own expression detection (`EXPRESSION_CHANGED`) or turn it off.
 - **Talking mouth animation** — the mouth-open parameter is animated while the character "speaks", scaled by message length (configurable speed and per-character duration; parameter auto-detected with the same fallbacks as the ST extension).
@@ -38,6 +39,7 @@ The extension works with whatever you grant and degrades gracefully:
 |---|---|---|
 | `app_manipulation` | rendering the avatar as a full-app overlay | the avatar renders inside the Live2D drawer tab preview |
 | `generation` | LLM emotion classification | no automatic emotion detection (native/off modes still work) |
+| `chats` | reading which characters are in the active chat | group chats show only the chat's first character |
 | `chat_mutation` | sending hit-area interaction messages | no interaction messages |
 | `chats` | resolving which character the active chat belongs to | falls back to the frontend's active-chat context |
 | `characters` | listing characters by name in the binding UI | bind models to the current chat's character only |
@@ -87,7 +89,7 @@ Live2D and Cubism are trademarks of Live2D Inc. This project is not affiliated w
 
 ## Known limitations
 
-- One model on stage at a time (the active chat's character). Group-chat multi-model staging is not implemented yet.
+- A character bound to a model in both Live2D Avatars and Spine Avatars gets one column, with both models drawn in it.
 - Motion sounds referenced by models play only if the browser allows autoplay.
 - Very large models (hundreds of MB) transfer to the browser on first load; subsequent loads come from the local cache.
 
