@@ -778,6 +778,8 @@ function dropEmptyFileReferences(json, cubism) {
       delete refs[key];
   }
 }
+var CLIP_INSET = 0.004;
+var CLIP_INSET_PX = 2;
 function modelSize(model) {
   return {
     width: model.internalModel?.width || 1,
@@ -1261,20 +1263,27 @@ class Stage {
       }
       return;
     }
-    if (entry.clip)
-      return;
     const { width: w, height: h } = modelSize(entry.model);
-    const far = 100 * Math.max(w, h);
-    const eraser = new PIXI.Graphics;
+    const pixelsPerUnit = Math.abs(entry.model.scale.x) || 1;
+    const inset = Math.min(Math.max(CLIP_INSET * Math.min(w, h), CLIP_INSET_PX / pixelsPerUnit), Math.min(w, h) / 4);
+    if (entry.clip && Math.abs(entry.clip.inset - inset) <= inset * 0.1)
+      return;
+    const eraser = entry.clip ?? new PIXI.Graphics;
+    eraser.clear();
     eraser.blendMode = PIXI.BLEND_MODES.ERASE;
+    const far = 100 * Math.max(w, h);
+    const [left, top, right, bottom] = [inset, inset, w - inset, h - inset];
     eraser.beginFill(16777215, 1);
-    eraser.drawRect(-far, -far, w + 2 * far, far);
-    eraser.drawRect(-far, h, w + 2 * far, far);
-    eraser.drawRect(-far, 0, far, h);
-    eraser.drawRect(w, 0, far, h);
+    eraser.drawRect(-far, -far, w + 2 * far, far + top);
+    eraser.drawRect(-far, bottom, w + 2 * far, far + h - bottom);
+    eraser.drawRect(-far, top, far + left, bottom - top);
+    eraser.drawRect(right, top, far + w - right, bottom - top);
     eraser.endFill();
-    entry.model.addChildAt(eraser, 0);
-    entry.clip = eraser;
+    eraser.inset = inset;
+    if (!entry.clip) {
+      entry.model.addChildAt(eraser, 0);
+      entry.clip = eraser;
+    }
   }
   applyCursorParams(entry, modelSettings) {
     if (!entry.model?.internalModel)
