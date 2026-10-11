@@ -42,7 +42,7 @@ export interface UIController {
 const REQUIRED_PERMS: Array<{ id: string; why: string }> = [
   { id: 'app_manipulation', why: 'show the avatar over the app (otherwise it renders inside this tab)' },
   { id: 'generation', why: 'classify message emotions with the LLM' },
-  { id: 'chat_mutation', why: 'read messages for emotion/talking and send hit-area interaction messages' },
+  { id: 'chat_mutation', why: 'send hit-area interaction messages' },
   { id: 'chats', why: 'know which character the active chat belongs to' },
   { id: 'characters', why: 'list your characters by name when assigning models' },
 ];

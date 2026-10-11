@@ -1329,7 +1329,7 @@ class Stage {
 var REQUIRED_PERMS = [
   { id: "app_manipulation", why: "show the avatar over the app (otherwise it renders inside this tab)" },
   { id: "generation", why: "classify message emotions with the LLM" },
-  { id: "chat_mutation", why: "read messages for emotion/talking and send hit-area interaction messages" },
+  { id: "chat_mutation", why: "send hit-area interaction messages" },
   { id: "chats", why: "know which character the active chat belongs to" },
   { id: "characters", why: "list your characters by name when assigning models" }
 ];
@@ -2202,10 +2202,12 @@ function setup(ctx) {
         playMappedExpression(msg);
         break;
       case "character_message": {
-        const { chatId } = stage.getChatContext();
-        if (chatId && msg.chatId === chatId && msg.textLength > 0) {
-          stage.playTalk(msg.textLength);
-        }
+        const { chatId, characterId } = stage.getChatContext();
+        if (!chatId || msg.chatId !== chatId || msg.textLength === 0)
+          break;
+        if (msg.characterId && characterId && msg.characterId !== characterId)
+          break;
+        stage.playTalk(msg.textLength);
         break;
       }
       case "chat_context":

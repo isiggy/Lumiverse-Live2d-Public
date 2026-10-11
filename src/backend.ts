@@ -9,6 +9,7 @@
 declare const spindle: import('lumiverse-spindle-types').SpindleAPI;
 
 import { unzipSync } from 'fflate';
+import type { ChatMessageDTO } from 'lumiverse-spindle-types';
 import type {
   BackendToFrontend,
   FrontendToBackend,
@@ -430,42 +431,33 @@ async function resolveChatCharacter(chatId: string, userId?: string): Promise<st
   }
 }
 
-async function handleCharacterMessageRendered(
-  payload: { chatId: string; messageId: string },
+/**
+ * A character's message arrived: make the model talk and, with LLM emotion
+ * detection, play the matching animation. In a group chat the message says
+ * which member wrote it, so the frontend can tell whether it's the one on stage.
+ */
+async function handleCharacterMessage(
+  chatId: string,
+  message: { id: string; content?: string; extra?: Record<string, unknown> | null },
   userId?: string,
 ): Promise<void> {
   const settings = await loadSettings(userId);
   if (!settings.global.enabled) return;
 
-  const characterId = await resolveChatCharacter(payload.chatId, userId);
-
-  let text = '';
-  if (spindle.permissions.has('chat_mutation')) {
-    try {
-      const messages = await spindle.chat.getMessages(payload.chatId);
-      const message = messages.find((entry) => entry.id === payload.messageId);
-      if (message && !message.is_user) text = message.content ?? '';
-    } catch (error) {
-      spindle.log.warn(`live2d: could not read message: ${String(error)}`);
-    }
-  }
-
-  send(
-    {
-      type: 'character_message',
-      chatId: payload.chatId,
-      characterId,
-      messageId: payload.messageId,
-      textLength: text.length,
-    },
-    userId,
+  // Replies carry their author as `character_id`; greetings as `greeting_character_id`.
+  const author = [message.extra?.character_id, message.extra?.greeting_character_id].find(
+    (id): id is string => typeof id === 'string' && id.length > 0,
   );
+  const characterId = author ?? (await resolveChatCharacter(chatId, userId));
+  const text = message.content ?? '';
+
+  send({ type: 'character_message', chatId, characterId, messageId: message.id, textLength: text.length }, userId);
 
   if (settings.global.expressionSource !== 'llm') return;
   if (!text) return;
 
   const label = await classifyExpression(text);
-  send({ type: 'expression', chatId: payload.chatId, characterId, label, source: 'llm' }, userId);
+  send({ type: 'expression', chatId, characterId, label, source: 'llm' }, userId);
 }
 
 async function handleInteraction(msg: InteractionMsg, userId?: string): Promise<void> {
@@ -554,10 +546,19 @@ spindle.onFrontendMessage(async (payload, userId) => {
 
 // ── Event subscriptions ─────────────────────────────────────────────────────
 
-spindle.on('CHARACTER_MESSAGE_RENDERED', (payload, userId) => {
-  const event = payload as { chatId: string; messageId: string };
-  if (!event?.chatId || !event?.messageId) return;
-  void handleCharacterMessageRendered(event, userId);
+// Lumiverse creates a reply's message once it has finished streaming, and a
+// regenerated reply as a new swipe. (The documented CHARACTER_MESSAGE_RENDERED
+// event is never emitted by the host.)
+spindle.on('MESSAGE_SENT', (payload, userId) => {
+  const event = payload as { chatId?: string; message?: ChatMessageDTO };
+  if (!event?.chatId || !event.message || event.message.is_user) return;
+  void handleCharacterMessage(event.chatId, event.message, userId);
+});
+
+spindle.on('MESSAGE_SWIPED', (payload, userId) => {
+  const event = payload as { chatId?: string; message?: ChatMessageDTO; action?: string };
+  if (!event?.chatId || !event.message || event.message.is_user || event.action !== 'added') return;
+  void handleCharacterMessage(event.chatId, event.message, userId);
 });
 
 // Reuse Lumiverse's native expression detection when the user prefers it.

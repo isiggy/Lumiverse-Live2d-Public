@@ -67,3 +67,4 @@ docs.lumiverse.chat is blocked by the network proxy. The same docs are in the Lu
 - `frontend/src/components/spindle/SpindleAppMount.tsx`: an `app-overlay` mount is a zero-height `position: relative` element at the end of the app root. That's why the stage host uses `position: fixed`.
 - `src/spindle/runtime-transport.ts`: how extension backends are spawned.
 - `src/routes/spindle.routes.ts`: extension install, enable and permission endpoints.
+- Messages: Lumiverse documents a `CHARACTER_MESSAGE_RENDERED` event but never emits it. A reply's message is created once it has finished streaming (`MESSAGE_SENT`) and a regenerated reply arrives as `MESSAGE_SWIPED` with `action: 'added'`. In a group chat the message's `extra.character_id` names the member who wrote it (`extra.greeting_character_id` for greetings).

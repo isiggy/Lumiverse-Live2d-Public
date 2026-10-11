@@ -37,7 +37,7 @@ The extension works with whatever you grant and degrades gracefully:
 |---|---|---|
 | `app_manipulation` | rendering the avatar as a full-app overlay | the avatar renders inside the Live2D drawer tab preview |
 | `generation` | LLM emotion classification | no automatic emotion detection (native/off modes still work) |
-| `chat_mutation` | reading messages (emotion + talking) and sending hit-area interaction messages | no talking animation, no interaction messages |
+| `chat_mutation` | sending hit-area interaction messages | no interaction messages |
 | `chats` | resolving which character the active chat belongs to | falls back to the frontend's active-chat context |
 | `characters` | listing characters by name in the binding UI | bind models to the current chat's character only |
 

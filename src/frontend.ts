@@ -367,10 +367,11 @@ export function setup(ctx: SpindleFrontendContext) {
         playMappedExpression(msg);
         break;
       case 'character_message': {
-        const { chatId } = stage.getChatContext();
-        if (chatId && msg.chatId === chatId && msg.textLength > 0) {
-          void stage.playTalk(msg.textLength);
-        }
+        // In a group chat only the character on stage talks.
+        const { chatId, characterId } = stage.getChatContext();
+        if (!chatId || msg.chatId !== chatId || msg.textLength === 0) break;
+        if (msg.characterId && characterId && msg.characterId !== characterId) break;
+        void stage.playTalk(msg.textLength);
         break;
       }
       case 'chat_context':
