@@ -20,6 +20,13 @@ import {
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** pixi-live2d-display's MotionPriority.IDLE: any other motion interrupts one playing at this priority. */
+const MOTION_PRIORITY_IDLE = 1;
+/** Motion group the looping default motion is copied into, then used as the model's idle group. */
+const DEFAULT_LOOP_GROUP = '__live2d_avatars_default__';
+/** How long another expression stays before the looping default expression comes back, unless a motion is still playing. */
+const EXPRESSION_HOLD_MS = 5000;
+
 /** Host UI under the pointer that must keep its clicks even where the model is drawn. */
 const INTERACTIVE_SELECTOR = [
   'input',
@@ -79,6 +86,13 @@ interface LoadedEntry {
   frames: any[];
   /** Erases everything drawn outside the model's canvas; null when clipping is off. */
   clip: any | null;
+  /** Last expression played ('none' before any) and when. */
+  expression: string;
+  expressionAt: number;
+  /** The model's own idle motion group, restored when the default stops looping. */
+  idleGroup: string | undefined;
+  /** Motion currently installed as the idle loop, or null when the model's own idle motions play. */
+  loopingMotion: string | null;
 }
 
 function dirname(path: string): string {
@@ -326,6 +340,10 @@ export class Stage {
       abortTalk: false,
       frames: [],
       clip: null,
+      expression: 'none',
+      expressionAt: 0,
+      idleGroup: model.internalModel.motionManager?.groups?.idle,
+      loopingMotion: null,
     };
     this.loaded = entry;
 
@@ -751,14 +769,58 @@ export class Stage {
         /* mid-reload */
       }
     }
+    try {
+      this.loopDefault(entry);
+    } catch {
+      /* mid-reload */
+    }
+  }
+
+  /**
+   * Keeps the default animation playing when "Loop the default animation" is on.
+   * The default motion becomes the model's idle motion, which pixi-live2d-display
+   * restarts whenever nothing else plays and which any other motion interrupts.
+   * The default expression comes back once other animations are done with it.
+   */
+  private loopDefault(entry: LoadedEntry): void {
+    const manager = entry.model.internalModel?.motionManager;
+    if (!manager) return;
+    const mapping = this.deps.getSettings().characterModelsSettings[entry.characterId]?.[entry.modelId]?.animation_default;
+    const loop = mapping?.loop === true;
+
+    const motion = loop && mapping.motion !== 'none' ? mapping.motion : null;
+    if (motion !== entry.loopingMotion) {
+      if (motion) {
+        const [group = motion, id] = motion.split('_id=');
+        const definitions: any[] = manager.definitions?.[group] ?? [];
+        manager.definitions[DEFAULT_LOOP_GROUP] =
+          id === undefined || id === 'random' ? definitions : definitions.slice(Number(id), Number(id) + 1);
+        manager.motionGroups[DEFAULT_LOOP_GROUP] = [];
+        manager.groups.idle = DEFAULT_LOOP_GROUP;
+      } else {
+        manager.groups.idle = entry.idleGroup;
+      }
+      entry.loopingMotion = motion;
+      // Swap out an idle motion that's already playing; leave any other motion to finish.
+      if (manager.state.currentPriority <= MOTION_PRIORITY_IDLE) manager.stopAllMotions();
+    }
+
+    if (!loop || mapping.expression === 'none' || entry.expression === mapping.expression) return;
+    const state = manager.state;
+    if (Math.max(state.currentPriority, state.reservePriority) > MOTION_PRIORITY_IDLE) return;
+    if (performance.now() - entry.expressionAt < EXPRESSION_HOLD_MS) return;
+    void this.playExpression(mapping.expression);
   }
 
   // ── Playback ──────────────────────────────────────────────────────────────
 
   async playExpression(expression: string): Promise<void> {
     if (!this.loaded || expression === 'none') return;
+    const entry = this.loaded;
     try {
-      await this.loaded.model.expression(expression);
+      await entry.model.expression(expression);
+      entry.expression = expression;
+      entry.expressionAt = performance.now();
     } catch (error) {
       this.deps.log(`Expression "${expression}" failed: ${String(error)}`);
     }
