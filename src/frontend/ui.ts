@@ -531,6 +531,13 @@ export class SettingsUI {
       }),
     );
     host.appendChild(
+      checkbox('Hide anything outside the model canvas', modelSettings.clip_to_canvas, (value) => {
+        modelSettings.clip_to_canvas = value;
+        controller.saveDebounced();
+        applyLive();
+      }),
+    );
+    host.appendChild(
       slider('Eye follow offset', -100, 100, 1, modelSettings.eye, (value) => {
         modelSettings.eye = value;
         controller.saveDebounced();

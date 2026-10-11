@@ -80,6 +80,8 @@ export interface ModelSettings {
   x: number; // percent offset from center, -100..100
   y: number;
   rotation: number; // degrees clockwise, -180..180
+  /** Hide whatever the model draws outside its own canvas (oversized backdrops in full-scene models). */
+  clip_to_canvas: boolean;
   eye: number; // eye follow offset (patched pixi-live2d-display), default 45
   cursor_param: Record<string, string>; // idParam* -> model parameter id or 'none'
   param_mouth_open_y_id: string; // parameter id or 'none'
@@ -160,6 +162,7 @@ export function defaultModelSettings(hitAreaNames: string[] = []): ModelSettings
     x: 0.0,
     y: 0.0,
     rotation: 0,
+    clip_to_canvas: true,
     eye: 45,
     cursor_param: {
       idParamAngleX: 'none',

@@ -442,6 +442,7 @@ function defaultModelSettings(hitAreaNames = []) {
     x: 0,
     y: 0,
     rotation: 0,
+    clip_to_canvas: true,
     eye: 45,
     cursor_param: {
       idParamAngleX: "none",
@@ -769,7 +770,8 @@ class Stage {
       lastMotion: null,
       talking: false,
       abortTalk: false,
-      frames: []
+      frames: [],
+      clip: null
     };
     this.loaded = entry;
     this.app.stage.addChild(model);
@@ -909,6 +911,32 @@ class Stage {
     entry.model.rotation = (settings.rotation || 0) * Math.PI / 180;
     entry.model.x = width / 2 + width / 2 * settings.x / 100;
     entry.model.y = height / 2 + height / 2 * settings.y / 100;
+    this.applyClip(entry, settings.clip_to_canvas);
+  }
+  applyClip(entry, clip) {
+    const PIXI = window.PIXI;
+    if (!clip || !PIXI) {
+      if (entry.clip) {
+        entry.model.removeChild(entry.clip);
+        entry.clip.destroy();
+        entry.clip = null;
+      }
+      return;
+    }
+    if (entry.clip)
+      return;
+    const { width: w, height: h } = modelSize(entry.model);
+    const far = 100 * Math.max(w, h);
+    const eraser = new PIXI.Graphics;
+    eraser.blendMode = PIXI.BLEND_MODES.ERASE;
+    eraser.beginFill(16777215, 1);
+    eraser.drawRect(-far, -far, w + 2 * far, far);
+    eraser.drawRect(-far, h, w + 2 * far, far);
+    eraser.drawRect(-far, 0, far, h);
+    eraser.drawRect(w, 0, far, h);
+    eraser.endFill();
+    entry.model.addChildAt(eraser, 0);
+    entry.clip = eraser;
   }
   applyCursorParams(entry = this.loaded, modelSettings) {
     if (!entry?.model?.internalModel)
@@ -946,6 +974,12 @@ class Stage {
     if (!PIXI || !internal)
       return false;
     try {
+      if (entry.clip) {
+        const onStage = entry.model.toLocal(new PIXI.Point(point.x, point.y));
+        const { width, height } = modelSize(entry.model);
+        if (onStage.x < 0 || onStage.y < 0 || onStage.x > width || onStage.y > height)
+          return false;
+      }
       const local = entry.model.toModelPosition(new PIXI.Point(point.x, point.y));
       const core = internal.coreModel;
       const hasOpacity = typeof core?.getDrawableOpacity === "function";
@@ -1607,6 +1641,11 @@ class SettingsUI {
       controller.saveDebounced();
       applyLive();
     }));
+    host.appendChild(checkbox("Hide anything outside the model canvas", modelSettings.clip_to_canvas, (value) => {
+      modelSettings.clip_to_canvas = value;
+      controller.saveDebounced();
+      applyLive();
+    }));
     host.appendChild(slider("Eye follow offset", -100, 100, 1, modelSettings.eye, (value) => {
       modelSettings.eye = value;
       controller.saveDebounced();
@@ -1806,8 +1845,10 @@ var STAGE_CSS = `
 html.live2d-avatars-hover, html.live2d-avatars-hover * { cursor: grab !important; }
 /* Background mode: the host mounts the overlay at z-index 9990 above the whole
    app. Drop it to 0 so it sits above the app's backdrop and global wallpaper
-   but under <main> (z-index 1), which holds the chat. */
+   but under <main> (z-index 1), which holds the chat. While a chat is open the
+   overlay moves into the chat view instead (see placeOverlay). */
 html.live2d-avatars-bg .live2d-avatars-mount { z-index: 0 !important; }
+html.live2d-avatars-bg .live2d-avatars-overlay { z-index: 0; }
 `;
 var TAB_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4.2"/><path d="M9.5 7.5h.01M14.5 7.5h.01"/><path d="M10 10c.6.6 1.3.9 2 .9s1.4-.3 2-.9"/><path d="M4.5 21c.8-3.6 3.9-6 7.5-6s6.7 2.4 7.5 6"/></svg>';
 function setup(ctx) {
@@ -1877,7 +1918,14 @@ function setup(ctx) {
           const host = document.createElement("div");
           host.className = "live2d-avatars-overlay";
           mount.root.appendChild(host);
-          overlayMount = { root: host, destroy: () => mount.destroy() };
+          overlayMount = {
+            root: host,
+            mountRoot: mount.root,
+            destroy: () => {
+              host.remove();
+              mount.destroy();
+            }
+          };
           cleanups.push(() => overlayMount?.destroy());
         } catch (error) {
           console.debug("[live2d] overlay mount unavailable:", error);
@@ -1897,8 +1945,49 @@ function setup(ctx) {
   const applyBackgroundMode = () => {
     const on = settings.global.enabled && settings.global.backgroundMode && overlayActive;
     document.documentElement.classList.toggle("live2d-avatars-bg", on);
+    setOverlayTracking(on);
+    placeOverlay();
   };
   cleanups.push(() => document.documentElement.classList.remove("live2d-avatars-bg"));
+  const placeOverlay = () => {
+    if (!overlayMount)
+      return;
+    const host = overlayMount.root;
+    const bgOn = document.documentElement.classList.contains("live2d-avatars-bg");
+    const next = host.nextElementSibling;
+    if (bgOn && host.isConnected && next?.getAttribute("data-lumiverse-surface") === "chat-body")
+      return;
+    const chatBody = bgOn ? document.querySelector('[data-component="ChatView"] > [data-lumiverse-surface="chat-body"]') : null;
+    const target = chatBody?.parentElement ?? overlayMount.mountRoot;
+    if (host.parentElement === target && (!chatBody || host.nextElementSibling === chatBody))
+      return;
+    target.insertBefore(host, chatBody ?? null);
+  };
+  let overlayObserver = null;
+  let placeFrame = null;
+  const setOverlayTracking = (on) => {
+    if (on && !overlayObserver) {
+      overlayObserver = new MutationObserver(() => {
+        if (placeFrame !== null)
+          return;
+        placeFrame = window.requestAnimationFrame(() => {
+          placeFrame = null;
+          placeOverlay();
+        });
+      });
+      overlayObserver.observe(document.querySelector("[data-app-root]") ?? document.body, {
+        childList: true,
+        subtree: true
+      });
+    } else if (!on && overlayObserver) {
+      overlayObserver.disconnect();
+      overlayObserver = null;
+      if (placeFrame !== null)
+        window.cancelAnimationFrame(placeFrame);
+      placeFrame = null;
+    }
+  };
+  cleanups.push(() => setOverlayTracking(false));
   let classifyPending = null;
   const controller = {
     getSettings: () => settings,
