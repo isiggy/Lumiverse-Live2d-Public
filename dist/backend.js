@@ -819,35 +819,20 @@ async function resolveChatCharacter(chatId, userId) {
     return null;
   }
 }
-async function handleCharacterMessageRendered(payload, userId) {
+async function handleCharacterMessage(chatId, message, userId) {
   const settings = await loadSettings(userId);
   if (!settings.global.enabled)
     return;
-  const characterId = await resolveChatCharacter(payload.chatId, userId);
-  let text = "";
-  if (spindle.permissions.has("chat_mutation")) {
-    try {
-      const messages = await spindle.chat.getMessages(payload.chatId);
-      const message = messages.find((entry) => entry.id === payload.messageId);
-      if (message && !message.is_user)
-        text = message.content ?? "";
-    } catch (error) {
-      spindle.log.warn(`live2d: could not read message: ${String(error)}`);
-    }
-  }
-  send({
-    type: "character_message",
-    chatId: payload.chatId,
-    characterId,
-    messageId: payload.messageId,
-    textLength: text.length
-  }, userId);
+  const author = [message.extra?.character_id, message.extra?.greeting_character_id].find((id) => typeof id === "string" && id.length > 0);
+  const characterId = author ?? await resolveChatCharacter(chatId, userId);
+  const text = message.content ?? "";
+  send({ type: "character_message", chatId, characterId, messageId: message.id, textLength: text.length }, userId);
   if (settings.global.expressionSource !== "llm")
     return;
   if (!text)
     return;
   const label = await classifyExpression(text);
-  send({ type: "expression", chatId: payload.chatId, characterId, label, source: "llm" }, userId);
+  send({ type: "expression", chatId, characterId, label, source: "llm" }, userId);
 }
 async function handleInteraction(msg, userId) {
   if (!spindle.permissions.has("chat_mutation")) {
@@ -917,11 +902,17 @@ spindle.onFrontendMessage(async (payload, userId) => {
     }
   }
 });
-spindle.on("CHARACTER_MESSAGE_RENDERED", (payload, userId) => {
+spindle.on("MESSAGE_SENT", (payload, userId) => {
   const event = payload;
-  if (!event?.chatId || !event?.messageId)
+  if (!event?.chatId || !event.message || event.message.is_user)
     return;
-  handleCharacterMessageRendered(event, userId);
+  handleCharacterMessage(event.chatId, event.message, userId);
+});
+spindle.on("MESSAGE_SWIPED", (payload, userId) => {
+  const event = payload;
+  if (!event?.chatId || !event.message || event.message.is_user || event.action !== "added")
+    return;
+  handleCharacterMessage(event.chatId, event.message, userId);
 });
 spindle.on("EXPRESSION_CHANGED", (payload, userId) => {
   const event = payload;
