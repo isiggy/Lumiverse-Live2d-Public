@@ -11,11 +11,13 @@ import { Stage, type ModelDescription } from './frontend/stage';
 import { SettingsUI, UI_CSS, type UIController } from './frontend/ui';
 import { tusUpload } from './frontend/tus';
 import type { BackendToFrontend, ExpressionMsg } from './shared/protocol';
+import { buildSettingsFile, parseSettingsFile, settingsFileName } from './shared/settings-file';
 import {
   defaultSettings,
   ensureModelSettingsShape,
   normalizeModelSettings,
   normalizeSettings,
+  sanitizeModelSettings,
   type Live2DSettings,
   type ModelRecord,
   type ModelSettings,
@@ -37,6 +39,18 @@ html.live2d-avatars-bg .live2d-avatars-overlay { z-index: 0; }
 
 const TAB_ICON =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4.2"/><path d="M9.5 7.5h.01M14.5 7.5h.01"/><path d="M10 10c.6.6 1.3.9 2 .9s1.4-.3 2-.9"/><path d="M4.5 21c.8-3.6 3.9-6 7.5-6s6.7 2.4 7.5 6"/></svg>';
+
+function downloadJson(fileName: string, value: unknown): void {
+  const url = URL.createObjectURL(new Blob([JSON.stringify(value, null, 2)], { type: 'application/json' }));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = fileName;
+  link.style.display = 'none';
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
 
 export function setup(ctx: SpindleFrontendContext) {
   ctx.deferReady();
@@ -105,6 +119,12 @@ export function setup(ctx: SpindleFrontendContext) {
         message,
         generate: settings.global.autoSendInteraction,
       });
+    },
+    saveThumbnail: (modelId, dataUrl) => {
+      // Shown right away; the backend confirms with model_updated.
+      models = models.map((model) => (model.id === modelId ? { ...model, thumbnail: dataUrl } : model));
+      ctx.sendToBackend({ type: 'save_thumbnail', modelId, dataUrl });
+      ui.refreshLibrary();
     },
     log: (message) => console.debug('[live2d]', message),
   });
@@ -276,6 +296,64 @@ export function setup(ctx: SpindleFrontendContext) {
     embeddedHost,
     usingOverlay: () => overlayActive,
     applyBackgroundMode,
+    mountSelect: ctx.components?.mountSelect
+      ? (target, options) => ctx.components.mountSelect(target, options)
+      : undefined,
+    exportModelSettings: (characterId, characterName) => {
+      const modelId = settings.characterModelMapping[characterId];
+      const record = models.find((model) => model.id === modelId);
+      if (!modelId || !record) return;
+      const stored = settings.characterModelsSettings[characterId]?.[modelId] ?? normalizeModelSettings(null);
+      const file = buildSettingsFile({ id: characterId, name: characterName }, record, stored);
+      downloadJson(settingsFileName(characterName, record.name), file);
+    },
+    importModelSettings: async (characterId, characterName) => {
+      const files = await ctx.uploads.pickFile({ accept: ['.json', 'application/json'], maxSizeBytes: 1024 * 1024 });
+      const picked = files[0];
+      if (!picked) return '';
+      const parsed = parseSettingsFile(new TextDecoder().decode(picked.bytes));
+      if ('error' in parsed) return parsed.error;
+      const { file } = parsed;
+      const fileModel = file.model.name || file.model.id || 'unknown';
+      const target =
+        models.find((model) => model.id === file.model.id) ??
+        models.find((model) => model.name.toLowerCase() === file.model.name.toLowerCase());
+      const bound = models.find((model) => model.id === settings.characterModelMapping[characterId]);
+      const record = target ?? bound;
+      if (!record) return `The model "${fileModel}" isn't in your library. Import it first, then try again.`;
+      const from = file.character.name && file.character.name !== characterName
+        ? ` (exported from "${file.character.name}")`
+        : '';
+      const message = target
+        ? `${characterName} will use "${record.name}" with the settings from this file${from}. ` +
+          `${characterName}'s current settings for that model are replaced.`
+        : `This file is for "${fileModel}", which isn't in your library. Apply its settings${from} to ` +
+          `"${record.name}", ${characterName}'s current model, instead? Animations it names that ` +
+          `"${record.name}" doesn't have are left unset.`;
+      const { confirmed } = await ctx.ui.showConfirm({
+        title: 'Import model settings',
+        message,
+        variant: target ? 'info' : 'warning',
+        confirmLabel: 'Import',
+      });
+      if (!confirmed) return '';
+      settings.characterModelMapping[characterId] = record.id;
+      (settings.characterModelsSettings[characterId] ??= {})[record.id] = normalizeModelSettings(
+        sanitizeModelSettings(file.settings),
+      );
+      saveNow();
+      void stage.reload();
+      return `Imported settings for "${record.name}".`;
+    },
+    updateThumbnail: (modelId) => {
+      if (stage.currentModel()?.modelId !== modelId) return false;
+      const dataUrl = stage.captureThumbnail();
+      if (!dataUrl) return false;
+      models = models.map((model) => (model.id === modelId ? { ...model, thumbnail: dataUrl } : model));
+      ctx.sendToBackend({ type: 'save_thumbnail', modelId, dataUrl });
+      ui.refreshLibrary();
+      return true;
+    },
   };
 
   const ui = new SettingsUI(controller);
@@ -342,6 +420,9 @@ export function setup(ctx: SpindleFrontendContext) {
         models = [...models.filter((model) => model.id !== msg.model.id), msg.model];
         ui.render();
         void stage.reload();
+        break;
+      case 'model_updated':
+        models = models.map((model) => (model.id === msg.model.id ? msg.model : model));
         break;
       case 'model_deleted':
         models = models.filter((model) => model.id !== msg.modelId);

@@ -7,6 +7,7 @@
 
 import type { ModelAssets, ModelBundle } from './assets';
 import { ensureLive2DRuntime } from './runtime';
+import { squareThumbnail, THUMBNAIL_RENDER_PIXELS } from './thumbnail';
 import {
   type ClickAnimation,
   type Live2DSettings,
@@ -26,6 +27,8 @@ const MOTION_PRIORITY_IDLE = 1;
 const DEFAULT_LOOP_GROUP = '__live2d_avatars_default__';
 /** How long another expression stays before the looping default expression comes back, unless a motion is still playing. */
 const EXPRESSION_HOLD_MS = 5000;
+/** How long a model has been on stage before its first thumbnail is taken (its textures and idle pose have settled). */
+const THUMBNAIL_DELAY_MS = 1500;
 
 /** Host UI under the pointer that must keep its clicks even where the model is drawn. */
 const INTERACTIVE_SELECTOR = [
@@ -72,6 +75,8 @@ export interface StageDeps {
   assets: ModelAssets;
   /** Send a hit-area interaction message into the chat. */
   sendInteraction(message: string): void;
+  /** Store a model's library thumbnail (an image data URL). */
+  saveThumbnail(modelId: string, dataUrl: string): void;
   log(message: string): void;
 }
 
@@ -182,6 +187,7 @@ export class Stage {
   private ticker: number | null = null;
   private resizeObserver: ResizeObserver | null = null;
   private starterTimer: number | null = null;
+  private thumbnailTimer: number | null = null;
   private previousInteraction = { characterId: '', message: '' };
   private descriptionCache = new Map<string, ModelDescription>();
   private drag: { entry: LoadedEntry; pointerId: number; offsetX: number; offsetY: number; moved: boolean } | null =
@@ -361,6 +367,58 @@ export class Stage {
         if (starter.motion !== 'none') void this.playMotion(starter.motion);
       }, Math.max(0, starter.delay));
     }
+
+    // A model's first appearance gives the library its thumbnail.
+    if (!record.thumbnail) {
+      this.thumbnailTimer = window.setTimeout(() => {
+        this.thumbnailTimer = null;
+        if (this.loaded !== entry || this.deps.getModelRecord(record.id)?.thumbnail) return;
+        const dataUrl = this.captureThumbnail();
+        if (dataUrl) this.deps.saveThumbnail(record.id, dataUrl);
+      }, THUMBNAIL_DELAY_MS);
+    }
+  }
+
+  /**
+   * A square picture of the model on stage, upright and centered, as an image
+   * data URL; null when no model is shown. The model is drawn once more into
+   * the canvas's corner, copied, and put back, all before the browser shows
+   * the canvas again, so nothing flickers.
+   */
+  captureThumbnail(): string | null {
+    const entry = this.loaded;
+    const app = this.app;
+    if (!entry || !app) return null;
+    const view: HTMLCanvasElement = app.view;
+    const pixels = Math.min(THUMBNAIL_RENDER_PIXELS, view.width, view.height);
+    if (pixels < 32) return null;
+    const box = pixels / app.renderer.resolution; // in stage units
+    const model = entry.model;
+    const { width: w, height: h } = modelSize(model);
+    const saved = { x: model.x, y: model.y, rotation: model.rotation, scale: model.scale.x };
+    let dataUrl: string | null = null;
+    try {
+      model.anchor.set(0.5, 0.5);
+      model.rotation = 0;
+      model.scale.set((box * 0.96) / Math.max(w, h));
+      model.x = box / 2;
+      model.y = box / 2;
+      const frames = entry.frames.map((frame) => [frame, frame.visible] as const);
+      for (const [frame] of frames) frame.visible = false;
+      app.renderer.render(app.stage);
+      for (const [frame, visible] of frames) frame.visible = visible;
+      dataUrl = squareThumbnail(view, pixels);
+    } catch (error) {
+      this.deps.log(`Thumbnail failed: ${String(error)}`);
+      return null;
+    } finally {
+      model.rotation = saved.rotation;
+      model.scale.set(saved.scale);
+      model.x = saved.x;
+      model.y = saved.y;
+      app.renderer.render(app.stage);
+    }
+    return dataUrl;
   }
 
   private async instantiate(
@@ -943,6 +1001,10 @@ export class Stage {
     if (this.starterTimer !== null) {
       window.clearTimeout(this.starterTimer);
       this.starterTimer = null;
+    }
+    if (this.thumbnailTimer !== null) {
+      window.clearTimeout(this.thumbnailTimer);
+      this.thumbnailTimer = null;
     }
     if (this.loaded) {
       this.loaded.abortTalk = true;

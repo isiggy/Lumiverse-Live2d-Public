@@ -116,7 +116,13 @@ export interface GlobalSettings {
    * - 'off'    — no automatic expression/motion on messages
    */
   expressionSource: 'llm' | 'native' | 'off';
+  /** Model library order and layout in the settings tab. */
+  librarySort: LibrarySort;
+  libraryView: LibraryView;
 }
+
+export type LibrarySort = 'name' | 'name_desc' | 'newest' | 'oldest' | 'largest' | 'smallest';
+export type LibraryView = 'tiles' | 'list';
 
 export interface Live2DSettings {
   global: GlobalSettings;
@@ -138,6 +144,8 @@ export interface ModelRecord {
   importedAt: string;
   /** bumped when files change; used for frontend cache invalidation */
   version: number;
+  /** Small picture of the model for the library (an image data URL), taken the first time it's shown. */
+  thumbnail?: string;
 }
 
 export function defaultGlobalSettings(): GlobalSettings {
@@ -150,6 +158,8 @@ export function defaultGlobalSettings(): GlobalSettings {
     force_loop: false,
     showFrames: false,
     expressionSource: 'llm',
+    librarySort: 'name',
+    libraryView: 'tiles',
   };
 }
 
@@ -255,5 +265,67 @@ export function normalizeModelSettings(raw: unknown, hitAreaNames: string[] = []
     hit_areas: { ...base.hit_areas, ...(value.hit_areas ?? {}) },
     classify_mapping: { ...base.classify_mapping, ...(value.classify_mapping ?? {}) },
   };
+  return out;
+}
+
+/**
+ * Keep only the fields of an untrusted per-model settings object (an imported
+ * file) whose types match the defaults, with numbers clamped to the sliders' ranges.
+ */
+export function sanitizeModelSettings(raw: unknown): Partial<ModelSettings> {
+  if (!isPlainObject(raw)) return {};
+  const base = defaultModelSettings() as unknown as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    const fallback = base[key];
+    if (fallback === undefined || typeof value !== typeof fallback) continue;
+    if (typeof value === 'number' && !Number.isFinite(value)) continue;
+    if (isPlainObject(fallback) !== isPlainObject(value)) continue;
+    out[key] = value;
+  }
+  for (const [key, [min, max]] of Object.entries(NUMBER_LIMITS)) {
+    if (typeof out[key] === 'number') out[key] = Math.min(max, Math.max(min, out[key] as number));
+  }
+  const strings = (value: unknown) =>
+    Object.fromEntries(Object.entries(value as object).filter(([, entry]) => typeof entry === 'string'));
+  const mappings = (value: unknown, extra: Record<string, unknown>) =>
+    Object.fromEntries(
+      Object.entries(value as object)
+        .filter(([, entry]) => isPlainObject(entry))
+        .map(([name, entry]) => [name, pickTyped(entry, { expression: 'none', motion: 'none', ...extra })]),
+    );
+  if (out.cursor_param) out.cursor_param = strings(out.cursor_param);
+  if (out.classify_mapping) out.classify_mapping = mappings(out.classify_mapping, {});
+  if (out.hit_areas) out.hit_areas = mappings(out.hit_areas, { message: '' });
+  for (const key of ['animation_starter', 'animation_default', 'animation_click'] as const) {
+    if (out[key]) out[key] = pickTyped(out[key], base[key] as Record<string, unknown>);
+  }
+  const starter = out.animation_starter as { delay?: number } | undefined;
+  if (starter?.delay !== undefined) starter.delay = Math.min(60_000, Math.max(0, starter.delay));
+  return out as Partial<ModelSettings>;
+}
+
+const NUMBER_LIMITS: Record<string, [number, number]> = {
+  scale: [0.05, 3],
+  x: [-100, 100],
+  y: [-100, 100],
+  rotation: [-180, 180],
+  eye: [-100, 100],
+  mouth_open_speed: [0.1, 3],
+  mouth_time_per_character: [0, 1000],
+};
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** The fields of `value` that `shape` has, with the same type. */
+function pickTyped(value: unknown, shape: Record<string, unknown>): Record<string, unknown> {
+  const source = value as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const [key, fallback] of Object.entries(shape)) {
+    const entry = source[key];
+    if (typeof entry === typeof fallback && !(typeof entry === 'number' && !Number.isFinite(entry))) out[key] = entry;
+  }
   return out;
 }

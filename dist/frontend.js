@@ -365,6 +365,50 @@ function ensureLive2DRuntime() {
   return runtimePromise;
 }
 
+// src/frontend/thumbnail.ts
+var THUMBNAIL_PIXELS = 256;
+var THUMBNAIL_RENDER_PIXELS = 512;
+function squareThumbnail(source, size) {
+  const copy = document.createElement("canvas");
+  copy.width = size;
+  copy.height = size;
+  const context = copy.getContext("2d", { willReadFrequently: true });
+  context.drawImage(source, 0, 0, size, size, 0, 0, size, size);
+  const { data } = context.getImageData(0, 0, size, size);
+  let minX = size;
+  let minY = size;
+  let maxX = -1;
+  let maxY = -1;
+  for (let y = 0;y < size; y++) {
+    for (let x = 0;x < size; x++) {
+      if (data[(y * size + x) * 4 + 3] < 8)
+        continue;
+      if (x < minX)
+        minX = x;
+      if (x > maxX)
+        maxX = x;
+      if (y < minY)
+        minY = y;
+      if (y > maxY)
+        maxY = y;
+    }
+  }
+  if (maxX < 0)
+    return null;
+  const side = Math.min(size, Math.ceil(Math.max(maxX - minX + 1, maxY - minY + 1) * 1.06));
+  const clamp = (start) => Math.min(size - side, Math.max(0, Math.round(start)));
+  const left = clamp((minX + maxX + 1) / 2 - side / 2);
+  const top = clamp((minY + maxY + 1) / 2 - side / 2);
+  const outSize = Math.min(THUMBNAIL_PIXELS, side);
+  const out = document.createElement("canvas");
+  out.width = outSize;
+  out.height = outSize;
+  const outContext = out.getContext("2d");
+  outContext.imageSmoothingQuality = "high";
+  outContext.drawImage(copy, left, top, side, side, 0, 0, outSize, outSize);
+  return out.toDataURL("image/webp", 0.85);
+}
+
 // src/shared/settings.ts
 var CLASSIFY_EXPRESSIONS = [
   "admiration",
@@ -426,7 +470,9 @@ function defaultGlobalSettings() {
     force_animation: false,
     force_loop: false,
     showFrames: false,
-    expressionSource: "llm"
+    expressionSource: "llm",
+    librarySort: "name",
+    libraryView: "tiles"
   };
 }
 function defaultSettings() {
@@ -528,12 +574,71 @@ function normalizeModelSettings(raw, hitAreaNames = []) {
   };
   return out;
 }
+function sanitizeModelSettings(raw) {
+  if (!isPlainObject(raw))
+    return {};
+  const base = defaultModelSettings();
+  const out = {};
+  for (const [key, value] of Object.entries(raw)) {
+    const fallback = base[key];
+    if (fallback === undefined || typeof value !== typeof fallback)
+      continue;
+    if (typeof value === "number" && !Number.isFinite(value))
+      continue;
+    if (isPlainObject(fallback) !== isPlainObject(value))
+      continue;
+    out[key] = value;
+  }
+  for (const [key, [min, max]] of Object.entries(NUMBER_LIMITS)) {
+    if (typeof out[key] === "number")
+      out[key] = Math.min(max, Math.max(min, out[key]));
+  }
+  const strings = (value) => Object.fromEntries(Object.entries(value).filter(([, entry]) => typeof entry === "string"));
+  const mappings = (value, extra) => Object.fromEntries(Object.entries(value).filter(([, entry]) => isPlainObject(entry)).map(([name, entry]) => [name, pickTyped(entry, { expression: "none", motion: "none", ...extra })]));
+  if (out.cursor_param)
+    out.cursor_param = strings(out.cursor_param);
+  if (out.classify_mapping)
+    out.classify_mapping = mappings(out.classify_mapping, {});
+  if (out.hit_areas)
+    out.hit_areas = mappings(out.hit_areas, { message: "" });
+  for (const key of ["animation_starter", "animation_default", "animation_click"]) {
+    if (out[key])
+      out[key] = pickTyped(out[key], base[key]);
+  }
+  const starter = out.animation_starter;
+  if (starter?.delay !== undefined)
+    starter.delay = Math.min(60000, Math.max(0, starter.delay));
+  return out;
+}
+var NUMBER_LIMITS = {
+  scale: [0.05, 3],
+  x: [-100, 100],
+  y: [-100, 100],
+  rotation: [-180, 180],
+  eye: [-100, 100],
+  mouth_open_speed: [0.1, 3],
+  mouth_time_per_character: [0, 1000]
+};
+function isPlainObject(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function pickTyped(value, shape) {
+  const source = value;
+  const out = {};
+  for (const [key, fallback] of Object.entries(shape)) {
+    const entry = source[key];
+    if (typeof entry === typeof fallback && !(typeof entry === "number" && !Number.isFinite(entry)))
+      out[key] = entry;
+  }
+  return out;
+}
 
 // src/frontend/stage.ts
 var delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 var MOTION_PRIORITY_IDLE = 1;
 var DEFAULT_LOOP_GROUP = "__live2d_avatars_default__";
 var EXPRESSION_HOLD_MS = 5000;
+var THUMBNAIL_DELAY_MS = 1500;
 var INTERACTIVE_SELECTOR = [
   "input",
   "textarea",
@@ -632,6 +737,7 @@ class Stage {
   ticker = null;
   resizeObserver = null;
   starterTimer = null;
+  thumbnailTimer = null;
   previousInteraction = { characterId: "", message: "" };
   descriptionCache = new Map;
   drag = null;
@@ -797,6 +903,55 @@ class Stage {
           this.playMotion(starter.motion);
       }, Math.max(0, starter.delay));
     }
+    if (!record.thumbnail) {
+      this.thumbnailTimer = window.setTimeout(() => {
+        this.thumbnailTimer = null;
+        if (this.loaded !== entry || this.deps.getModelRecord(record.id)?.thumbnail)
+          return;
+        const dataUrl = this.captureThumbnail();
+        if (dataUrl)
+          this.deps.saveThumbnail(record.id, dataUrl);
+      }, THUMBNAIL_DELAY_MS);
+    }
+  }
+  captureThumbnail() {
+    const entry = this.loaded;
+    const app = this.app;
+    if (!entry || !app)
+      return null;
+    const view = app.view;
+    const pixels = Math.min(THUMBNAIL_RENDER_PIXELS, view.width, view.height);
+    if (pixels < 32)
+      return null;
+    const box = pixels / app.renderer.resolution;
+    const model = entry.model;
+    const { width: w, height: h } = modelSize(model);
+    const saved = { x: model.x, y: model.y, rotation: model.rotation, scale: model.scale.x };
+    let dataUrl = null;
+    try {
+      model.anchor.set(0.5, 0.5);
+      model.rotation = 0;
+      model.scale.set(box * 0.96 / Math.max(w, h));
+      model.x = box / 2;
+      model.y = box / 2;
+      const frames = entry.frames.map((frame) => [frame, frame.visible]);
+      for (const [frame] of frames)
+        frame.visible = false;
+      app.renderer.render(app.stage);
+      for (const [frame, visible] of frames)
+        frame.visible = visible;
+      dataUrl = squareThumbnail(view, pixels);
+    } catch (error) {
+      this.deps.log(`Thumbnail failed: ${String(error)}`);
+      return null;
+    } finally {
+      model.rotation = saved.rotation;
+      model.scale.set(saved.scale);
+      model.x = saved.x;
+      model.y = saved.y;
+      app.renderer.render(app.stage);
+    }
+    return dataUrl;
   }
   async instantiate(PIXI, bundle, json, eyeOffset) {
     const baseDir = dirname(bundle.settingsFile);
@@ -1306,6 +1461,10 @@ class Stage {
       window.clearTimeout(this.starterTimer);
       this.starterTimer = null;
     }
+    if (this.thumbnailTimer !== null) {
+      window.clearTimeout(this.thumbnailTimer);
+      this.thumbnailTimer = null;
+    }
     if (this.loaded) {
       this.loaded.abortTalk = true;
       try {
@@ -1415,6 +1574,50 @@ function row(...children) {
 function note(text) {
   return el("p", "l2d-note", text);
 }
+var SORT_OPTIONS = [
+  { value: "name", label: "Name (A–Z)" },
+  { value: "name_desc", label: "Name (Z–A)" },
+  { value: "newest", label: "Newest first" },
+  { value: "oldest", label: "Oldest first" },
+  { value: "largest", label: "Largest first" },
+  { value: "smallest", label: "Smallest first" }
+];
+var SEARCH_THRESHOLD = 6;
+var byName = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+function sortModels(models, sort) {
+  const time = (model) => Date.parse(model.importedAt) || 0;
+  const compare = {
+    name: (a, b) => byName.compare(a.name, b.name),
+    name_desc: (a, b) => byName.compare(b.name, a.name),
+    newest: (a, b) => time(b) - time(a),
+    oldest: (a, b) => time(a) - time(b),
+    largest: (a, b) => b.sizeBytes - a.sizeBytes,
+    smallest: (a, b) => a.sizeBytes - b.sizeBytes
+  };
+  const order = compare[sort] ?? compare.name;
+  return [...models].sort((a, b) => order(a, b) || byName.compare(a.name, b.name));
+}
+function libraryView(view) {
+  return view === "list" ? "list" : "tiles";
+}
+function modelSummary(model) {
+  return `Cubism ${model.cubism} · ${(model.sizeBytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+function initial(name) {
+  return (name.trim()[0] ?? "?").toUpperCase();
+}
+function thumbnail(model, className) {
+  if (model.thumbnail) {
+    const image = el("img", className);
+    image.src = model.thumbnail;
+    image.alt = "";
+    return image;
+  }
+  return el("div", `${className} l2d-thumb-empty`, initial(model.name));
+}
+function modelLeading(model) {
+  return model.thumbnail ? { type: "image", src: model.thumbnail, rounded: false, fallback: { text: initial(model.name) } } : { type: "initial", text: initial(model.name) };
+}
 function expressionOptions(description) {
   const options = [{ value: "none", label: "None" }];
   for (const expression of description?.expressions ?? []) {
@@ -1448,6 +1651,11 @@ class SettingsUI {
   root = null;
   selectedCharacterId = null;
   selectedModelId = null;
+  libraryFilter = "";
+  libraryList = null;
+  fileStatusText = "";
+  mounted = [];
+  pendingMounts = [];
   constructor(controller) {
     this.controller = controller;
   }
@@ -1459,6 +1667,12 @@ class SettingsUI {
     const root = this.root;
     if (!root)
       return;
+    for (const handle of this.mounted.splice(0)) {
+      try {
+        handle.destroy();
+      } catch {}
+    }
+    this.pendingMounts = [];
     root.replaceChildren();
     root.classList.add("l2d-root");
     const controller = this.controller;
@@ -1516,25 +1730,51 @@ class SettingsUI {
       preview.appendChild(controller.embeddedHost);
       root.appendChild(preview);
     }
-    const library = el("div");
     const models = controller.getModels();
+    const library = el("div");
+    const libraryList = el("div");
+    this.libraryList = libraryList;
     if (models.length === 0) {
       library.appendChild(note("No models imported yet. Import a Live2D model folder as a .zip archive."));
+    } else {
+      const filter = el("input", "l2d-input l2d-library-filter");
+      filter.type = "search";
+      filter.placeholder = "Filter models…";
+      filter.value = this.libraryFilter;
+      filter.addEventListener("input", () => {
+        this.libraryFilter = filter.value;
+        this.renderLibraryList(libraryList);
+      });
+      const sort = select(SORT_OPTIONS, globals.librarySort, (value) => {
+        globals.librarySort = value;
+        controller.saveDebounced();
+        this.renderLibraryList(libraryList);
+      });
+      sort.title = "Sort models";
+      const views = el("div", "l2d-segmented");
+      const viewButtons = ["tiles", "list"].map((view) => {
+        const viewButton = button(view === "tiles" ? "Tiles" : "List", () => {
+          globals.libraryView = view;
+          controller.saveDebounced();
+          for (const other of viewButtons)
+            other.classList.toggle("l2d-active", other === viewButton);
+          this.renderLibraryList(libraryList);
+        });
+        viewButton.classList.toggle("l2d-active", libraryView(globals.libraryView) === view);
+        views.appendChild(viewButton);
+        return viewButton;
+      });
+      library.appendChild(row(filter, sort, views));
     }
-    for (const model of models) {
-      const megabytes = (model.sizeBytes / (1024 * 1024)).toFixed(1);
-      const line = row(el("span", "l2d-model-name", `${model.name}`), el("span", "l2d-dim", `Cubism ${model.cubism} · ${model.fileCount} files · ${megabytes} MB`), button("Delete", () => {
-        controller.deleteModel(model.id);
-      }));
-      library.appendChild(line);
-    }
+    library.appendChild(libraryList);
+    this.renderLibraryList(libraryList);
     const importStatus = el("span", "l2d-dim", "");
     library.appendChild(row(button("Import model (.zip)", () => {
       this.controller.importZip((text) => {
         importStatus.textContent = text;
       });
     }), importStatus));
-    library.appendChild(note("Zip the model folder (the *.model3.json or *.model.json file plus textures, motions and expressions). " + "A sillytavern_settings.json preset in the folder is applied automatically."));
+    library.appendChild(note("Zip the model folder (the *.model3.json or *.model.json file plus textures, motions and expressions). " + "A sillytavern_settings.json preset in the folder is applied automatically. " + "A model's thumbnail is taken the first time it's shown."));
     root.appendChild(section("Model library", library));
     const characters = [...controller.getCharacters()];
     const activeCharacterId = controller.getActiveCharacterId();
@@ -1549,16 +1789,27 @@ class SettingsUI {
     if (characters.length === 0) {
       bindingSection.appendChild(note('Open a chat (or grant the "characters" permission) to assign a model to a character.'));
     } else {
-      const characterSelect = select(characters.map((character) => ({ value: character.id, label: character.name })), this.selectedCharacterId ?? characters[0].id, (value) => {
+      const characterSelect = this.picker(characters.map((character) => ({
+        value: character.id,
+        label: character.name,
+        leading: {
+          type: "image",
+          src: `/api/v1/characters/${encodeURIComponent(character.id)}/avatar?size=sm`,
+          fallback: { text: initial(character.name) }
+        }
+      })), this.selectedCharacterId ?? characters[0].id, (value) => {
         this.selectedCharacterId = value;
+        this.fileStatusText = "";
         this.render();
-      });
+      }, { placeholder: "Choose a character", searchPlaceholder: "Search characters…" });
       const boundModelId = this.selectedCharacterId ? settings.characterModelMapping[this.selectedCharacterId] ?? "none" : "none";
       this.selectedModelId = boundModelId === "none" ? null : boundModelId;
-      const modelSelect = select([
-        { value: "none", label: "No model" },
-        ...models.map((model) => ({ value: model.id, label: model.name }))
-      ], boundModelId, (value) => {
+      const modelSelect = this.picker(sortModels(models, globals.librarySort).map((model) => ({
+        value: model.id,
+        label: model.name,
+        sublabel: modelSummary(model),
+        leading: modelLeading(model)
+      })), boundModelId, (value) => {
         const characterId = this.selectedCharacterId;
         if (!characterId)
           return;
@@ -1569,9 +1820,31 @@ class SettingsUI {
         controller.saveNow();
         controller.reloadStage();
         this.render();
-      });
+      }, { placeholder: "No model", searchPlaceholder: "Search models…", noneLabel: "No model" });
       bindingSection.appendChild(row("Character", characterSelect));
       bindingSection.appendChild(row("Model", modelSelect));
+      const characterName = () => characters.find((character) => character.id === this.selectedCharacterId)?.name ?? "Character";
+      const fileStatus = el("span", "l2d-dim", this.fileStatusText);
+      const exportButton = button("Export settings", () => {
+        if (this.selectedCharacterId)
+          controller.exportModelSettings(this.selectedCharacterId, characterName());
+      });
+      exportButton.disabled = boundModelId === "none";
+      exportButton.title = "Save this character’s model and animation settings to a file";
+      const importButton = button("Import settings", () => {
+        const characterId = this.selectedCharacterId;
+        if (!characterId)
+          return;
+        fileStatus.textContent = "";
+        controller.importModelSettings(characterId, characterName()).catch((error) => `Import failed: ${String(error)}`).then((status) => {
+          if (this.selectedCharacterId !== characterId)
+            return;
+          this.fileStatusText = status;
+          this.render();
+        });
+      });
+      importButton.title = "Load model and animation settings for this character from a file";
+      bindingSection.appendChild(row(exportButton, importButton, fileStatus));
       bindingSection.appendChild(row(button("Clear model settings for this character", () => {
         const characterId = this.selectedCharacterId;
         if (!characterId)
@@ -1626,6 +1899,90 @@ class SettingsUI {
         testResult.textContent = String(error);
       });
     }), testResult)));
+    for (const mount of this.pendingMounts.splice(0))
+      mount();
+  }
+  refreshLibrary() {
+    if (this.libraryList)
+      this.renderLibraryList(this.libraryList);
+  }
+  renderLibraryList(host) {
+    const controller = this.controller;
+    const settings = controller.getSettings();
+    const models = controller.getModels();
+    host.replaceChildren();
+    if (models.length === 0)
+      return;
+    const needle = this.libraryFilter.trim().toLowerCase();
+    const shown = sortModels(needle ? models.filter((model) => model.name.toLowerCase().includes(needle)) : models, settings.global.librarySort);
+    if (shown.length === 0) {
+      host.appendChild(note(`No models match “${this.libraryFilter.trim()}”.`));
+      return;
+    }
+    const boundTo = (modelId) => Object.values(settings.characterModelMapping).filter((bound) => bound === modelId).length;
+    const remove = (model, label) => {
+      const removeButton = button(label, () => {
+        controller.deleteModel(model.id);
+      });
+      removeButton.title = `Delete ${model.name}`;
+      removeButton.setAttribute("aria-label", `Delete ${model.name}`);
+      return removeButton;
+    };
+    if (libraryView(settings.global.libraryView) === "tiles") {
+      const grid = el("div", "l2d-tiles");
+      for (const model of shown) {
+        const tile = el("div", "l2d-tile");
+        const used = boundTo(model.id);
+        tile.title = `${model.name}
+${modelSummary(model)}${used ? `
+Used by ${used} character${used === 1 ? "" : "s"}` : ""}`;
+        tile.appendChild(thumbnail(model, "l2d-tile-thumb"));
+        tile.appendChild(el("div", "l2d-tile-name", model.name));
+        tile.appendChild(el("div", "l2d-tile-meta", `${(model.sizeBytes / (1024 * 1024)).toFixed(1)} MB`));
+        const removeButton = remove(model, "✕");
+        removeButton.classList.add("l2d-tile-delete");
+        tile.appendChild(removeButton);
+        grid.appendChild(tile);
+      }
+      host.appendChild(grid);
+      return;
+    }
+    for (const model of shown) {
+      const megabytes = (model.sizeBytes / (1024 * 1024)).toFixed(1);
+      const line = el("div", "l2d-list-row");
+      const text = el("div", "l2d-list-text");
+      text.appendChild(el("div", "l2d-model-name", model.name));
+      text.appendChild(el("div", "l2d-dim", `Cubism ${model.cubism} · ${model.fileCount} files · ${megabytes} MB`));
+      line.append(thumbnail(model, "l2d-list-thumb"), text, remove(model, "Delete"));
+      host.appendChild(line);
+    }
+  }
+  picker(options, value, onChange, config) {
+    const fallback = () => select([...config.noneLabel ? [{ value: "none", label: config.noneLabel }] : [], ...options], value, onChange);
+    const mount = this.controller.mountSelect;
+    if (!mount)
+      return fallback();
+    const host = el("div", "l2d-picker");
+    this.pendingMounts.push(() => {
+      try {
+        this.mounted.push(mount(host, {
+          options,
+          value: value === "none" ? "" : value,
+          clearable: config.noneLabel !== undefined,
+          clearLabel: config.noneLabel,
+          placeholder: config.placeholder,
+          searchPlaceholder: config.searchPlaceholder,
+          noResultsMessage: "No matches",
+          searchThreshold: SEARCH_THRESHOLD,
+          maxHeight: 360,
+          onChange: (next) => onChange(next === "" ? "none" : next)
+        }));
+      } catch (error) {
+        console.debug("[live2d] host dropdown unavailable:", error);
+        host.replaceChildren(fallback());
+      }
+    });
+    return host;
   }
   renderModelSettings(host, characterId, modelId, description) {
     const controller = this.controller;
@@ -1675,6 +2032,8 @@ class SettingsUI {
       center();
       controller.saveDebounced();
       applyLive();
+    }), button("Update thumbnail", () => {
+      fitHint.textContent = controller.updateThumbnail(modelId) ? "Thumbnail updated." : "Show the model first, then try again.";
     }), fitHint));
     host.appendChild(scaleSlider);
     host.appendChild(xSlider);
@@ -1835,6 +2194,27 @@ var UI_CSS = `
 .l2d-banner { border: 1px solid var(--lumiverse-accent); border-radius: var(--lumiverse-radius); padding: 8px 10px; margin-bottom: 10px; }
 .l2d-banner-title { font-weight: 600; margin-bottom: 4px; }
 .l2d-banner-line { color: var(--lumiverse-text-muted); font-size: 12px; margin: 2px 0 6px; }
+.l2d-segmented { display: inline-flex; }
+.l2d-segmented .l2d-btn { border-radius: 0; }
+.l2d-segmented .l2d-btn:first-child { border-radius: var(--lumiverse-radius) 0 0 var(--lumiverse-radius); }
+.l2d-segmented .l2d-btn:last-child { border-radius: 0 var(--lumiverse-radius) var(--lumiverse-radius) 0; margin-left: -1px; }
+.l2d-btn.l2d-active { background: var(--lumiverse-fill-hover, var(--lumiverse-fill)); border-color: var(--lumiverse-accent); }
+.l2d-btn:disabled { opacity: 0.5; cursor: default; }
+.l2d-library-filter { min-width: 140px; }
+.l2d-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(88px, 1fr)); gap: 6px; margin: 8px 0; }
+.l2d-tile { position: relative; display: flex; flex-direction: column; gap: 2px; min-width: 0; padding: 4px; border: 1px solid var(--lumiverse-border); border-radius: var(--lumiverse-radius); background: var(--lumiverse-fill); }
+.l2d-tile-delete { position: absolute; top: 6px; right: 6px; padding: 0 6px !important; font-size: 11px; line-height: 18px; opacity: 0.55; }
+.l2d-tile:hover .l2d-tile-delete, .l2d-tile-delete:focus-visible { opacity: 1; }
+.l2d-tile-meta { color: var(--lumiverse-text-dim); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.l2d-tile-thumb { width: 100%; aspect-ratio: 1; object-fit: contain; border-radius: var(--lumiverse-radius); background: var(--lumiverse-fill-subtle); }
+.l2d-tile-name { font-weight: 600; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.l2d-list-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+.l2d-list-text { flex: 1; min-width: 0; }
+.l2d-list-text > * { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.l2d-list-thumb { width: 32px; height: 32px; object-fit: contain; border-radius: var(--lumiverse-radius); background: var(--lumiverse-fill-subtle); flex: none; }
+.l2d-thumb-empty { display: flex; align-items: center; justify-content: center; color: var(--lumiverse-text-dim); font-weight: 600; font-size: 20px; }
+.l2d-list-thumb.l2d-thumb-empty { font-size: 14px; }
+.l2d-picker { flex: 1; min-width: 180px; max-width: 360px; }
 .l2d-embedded-host { position: relative; width: 100%; height: 420px; overflow: hidden; border-radius: var(--lumiverse-radius); border: 1px solid var(--lumiverse-border); }
 `;
 
@@ -1886,6 +2266,67 @@ async function tusUpload(bytes, filename, extensionIdentifier, onProgress) {
   return uploadId;
 }
 
+// src/shared/settings-file.ts
+var SETTINGS_FILE_FORMAT = "lumiverse-avatar-model-settings";
+var SETTINGS_FILE_VERSION = 1;
+var SETTINGS_FILE_EXTENSION = "live2d";
+var EXTENSION_NAMES = { live2d: "Live2D", spine: "Spine" };
+function buildSettingsFile(character, model, settings) {
+  return {
+    format: SETTINGS_FILE_FORMAT,
+    version: SETTINGS_FILE_VERSION,
+    extension: SETTINGS_FILE_EXTENSION,
+    exportedAt: new Date().toISOString(),
+    character: { id: character.id, name: character.name },
+    model: { id: model.id, name: model.name },
+    settings: JSON.parse(JSON.stringify(settings))
+  };
+}
+function settingsFileName(characterName, modelName) {
+  const clean = (text) => text.replace(/[\\/:*?"<>|\u0000-\u001f]+/g, "_").trim().slice(0, 60) || "model";
+  return `${clean(characterName)} - ${clean(modelName)}.${SETTINGS_FILE_EXTENSION}-settings.json`;
+}
+function parseSettingsFile(text) {
+  let raw;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return { error: "This file isn't valid JSON." };
+  }
+  const value = raw;
+  if (!value || typeof value !== "object" || value.format !== SETTINGS_FILE_FORMAT) {
+    return { error: "This isn't a model settings file exported from the Live2D or Spine Avatars extension." };
+  }
+  if (value.extension !== SETTINGS_FILE_EXTENSION) {
+    const name = EXTENSION_NAMES[String(value.extension)] ?? String(value.extension);
+    return { error: `This file holds ${name} model settings. Import it in the ${name} Avatars extension.` };
+  }
+  if (typeof value.version !== "number" || value.version > SETTINGS_FILE_VERSION) {
+    return { error: "This file was made by a newer version of the extension. Update the extension, then try again." };
+  }
+  if (!value.settings || typeof value.settings !== "object" || Array.isArray(value.settings)) {
+    return { error: "This file has no model settings in it." };
+  }
+  const named = (part) => {
+    const object = part && typeof part === "object" ? part : {};
+    return {
+      id: typeof object.id === "string" ? object.id : "",
+      name: typeof object.name === "string" ? object.name : ""
+    };
+  };
+  return {
+    file: {
+      format: SETTINGS_FILE_FORMAT,
+      version: value.version,
+      extension: value.extension,
+      exportedAt: typeof value.exportedAt === "string" ? value.exportedAt : "",
+      character: named(value.character),
+      model: named(value.model),
+      settings: value.settings
+    }
+  };
+}
+
 // src/frontend.ts
 var EXTENSION_ID = "live2d_avatars";
 var STAGE_CSS = `
@@ -1900,6 +2341,17 @@ html.live2d-avatars-bg .live2d-avatars-mount { z-index: 0 !important; }
 html.live2d-avatars-bg .live2d-avatars-overlay { z-index: 0; }
 `;
 var TAB_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4.2"/><path d="M9.5 7.5h.01M14.5 7.5h.01"/><path d="M10 10c.6.6 1.3.9 2 .9s1.4-.3 2-.9"/><path d="M4.5 21c.8-3.6 3.9-6 7.5-6s6.7 2.4 7.5 6"/></svg>';
+function downloadJson(fileName, value) {
+  const url = URL.createObjectURL(new Blob([JSON.stringify(value, null, 2)], { type: "application/json" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fileName;
+  link.style.display = "none";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
 function setup(ctx) {
   ctx.deferReady();
   let settings = defaultSettings();
@@ -1952,6 +2404,11 @@ function setup(ctx) {
         message,
         generate: settings.global.autoSendInteraction
       });
+    },
+    saveThumbnail: (modelId, dataUrl) => {
+      models = models.map((model) => model.id === modelId ? { ...model, thumbnail: dataUrl } : model);
+      ctx.sendToBackend({ type: "save_thumbnail", modelId, dataUrl });
+      ui.refreshLibrary();
     },
     log: (message) => console.debug("[live2d]", message)
   });
@@ -2108,7 +2565,59 @@ function setup(ctx) {
     },
     embeddedHost,
     usingOverlay: () => overlayActive,
-    applyBackgroundMode
+    applyBackgroundMode,
+    mountSelect: ctx.components?.mountSelect ? (target, options) => ctx.components.mountSelect(target, options) : undefined,
+    exportModelSettings: (characterId, characterName) => {
+      const modelId = settings.characterModelMapping[characterId];
+      const record = models.find((model) => model.id === modelId);
+      if (!modelId || !record)
+        return;
+      const stored = settings.characterModelsSettings[characterId]?.[modelId] ?? normalizeModelSettings(null);
+      const file = buildSettingsFile({ id: characterId, name: characterName }, record, stored);
+      downloadJson(settingsFileName(characterName, record.name), file);
+    },
+    importModelSettings: async (characterId, characterName) => {
+      const files = await ctx.uploads.pickFile({ accept: [".json", "application/json"], maxSizeBytes: 1024 * 1024 });
+      const picked = files[0];
+      if (!picked)
+        return "";
+      const parsed = parseSettingsFile(new TextDecoder().decode(picked.bytes));
+      if ("error" in parsed)
+        return parsed.error;
+      const { file } = parsed;
+      const fileModel = file.model.name || file.model.id || "unknown";
+      const target = models.find((model) => model.id === file.model.id) ?? models.find((model) => model.name.toLowerCase() === file.model.name.toLowerCase());
+      const bound = models.find((model) => model.id === settings.characterModelMapping[characterId]);
+      const record = target ?? bound;
+      if (!record)
+        return `The model "${fileModel}" isn't in your library. Import it first, then try again.`;
+      const from = file.character.name && file.character.name !== characterName ? ` (exported from "${file.character.name}")` : "";
+      const message = target ? `${characterName} will use "${record.name}" with the settings from this file${from}. ` + `${characterName}'s current settings for that model are replaced.` : `This file is for "${fileModel}", which isn't in your library. Apply its settings${from} to ` + `"${record.name}", ${characterName}'s current model, instead? Animations it names that ` + `"${record.name}" doesn't have are left unset.`;
+      const { confirmed } = await ctx.ui.showConfirm({
+        title: "Import model settings",
+        message,
+        variant: target ? "info" : "warning",
+        confirmLabel: "Import"
+      });
+      if (!confirmed)
+        return "";
+      settings.characterModelMapping[characterId] = record.id;
+      (settings.characterModelsSettings[characterId] ??= {})[record.id] = normalizeModelSettings(sanitizeModelSettings(file.settings));
+      saveNow();
+      stage.reload();
+      return `Imported settings for "${record.name}".`;
+    },
+    updateThumbnail: (modelId) => {
+      if (stage.currentModel()?.modelId !== modelId)
+        return false;
+      const dataUrl = stage.captureThumbnail();
+      if (!dataUrl)
+        return false;
+      models = models.map((model) => model.id === modelId ? { ...model, thumbnail: dataUrl } : model);
+      ctx.sendToBackend({ type: "save_thumbnail", modelId, dataUrl });
+      ui.refreshLibrary();
+      return true;
+    }
   };
   const ui = new SettingsUI(controller);
   const tab = ctx.ui.registerDrawerTab({
@@ -2177,6 +2686,9 @@ function setup(ctx) {
         models = [...models.filter((model) => model.id !== msg.model.id), msg.model];
         ui.render();
         stage.reload();
+        break;
+      case "model_updated":
+        models = models.map((model) => model.id === msg.model.id ? msg.model : model);
         break;
       case "model_deleted":
         models = models.filter((model) => model.id !== msg.modelId);
