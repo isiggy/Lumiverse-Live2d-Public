@@ -266,6 +266,8 @@ export class SettingsUI {
   private selectedCharacterId: string | null = null;
   /** The chat's character when the tab last rendered; the selection follows it across chat switches. */
   private lastActiveCharacterId: string | null = null;
+  /** Refreshes the layout sliders from the stored settings (after a drag on the stage). */
+  private syncLayout: (() => void) | null = null;
   private selectedModelId: string | null = null;
   /** Model library filter text (not saved). */
   private libraryFilter = '';
@@ -285,6 +287,11 @@ export class SettingsUI {
   }
 
   /** Re-render from current state (cheap enough for a settings panel). */
+  /** The stage moved a model (drag); show the new position on the sliders. */
+  layoutChanged(): void {
+    this.syncLayout?.();
+  }
+
   render(): void {
     const root = this.root;
     if (!root) return;
@@ -298,6 +305,7 @@ export class SettingsUI {
     this.pendingMounts = [];
     root.replaceChildren();
     root.classList.add('l2d-root');
+    this.syncLayout = null;
 
     const controller = this.controller;
     const settings = controller.getSettings();
@@ -783,6 +791,11 @@ export class SettingsUI {
       controller.saveDebounced();
       applyLive();
     });
+    this.syncLayout = () => {
+      scaleSlider.setValue(modelSettings.scale);
+      xSlider.setValue(modelSettings.x);
+      ySlider.setValue(modelSettings.y);
+    };
     const center = () => {
       modelSettings.x = 0;
       modelSettings.y = 0;

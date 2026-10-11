@@ -597,7 +597,8 @@ async function runGroup() {
   await selectCharacterIn(live2d, members[0]);
   const draggedX = await sliderValue('X offset (%)');
   const columnWidth = afterLive2D.width / members.length;
-  const expectedX = (shift / (columnWidth / 2)) * 100;
+  // The model follows the pointer exactly (40px from x = 0 after Fit); its drawn box can move less.
+  const expectedX = (40 / (columnWidth / 2)) * 100;
   check(
     Math.abs(draggedX - expectedX) < 3,
     `member 1's X offset is relative to its column: ${draggedX}% (expected about ${expectedX.toFixed(1)}%)`,

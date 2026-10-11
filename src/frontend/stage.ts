@@ -83,6 +83,8 @@ export interface StageDeps {
     preset?: unknown,
   ): ModelSettings;
   saveSettingsDebounced(): void;
+  /** The stage changed a model's position itself (a drag). */
+  layoutChanged(): void;
   assets: ModelAssets;
   /** Whether the stage draws over the app (rather than in the settings tab), where other avatar extensions draw too. */
   drawsOverApp(): boolean;
@@ -885,6 +887,7 @@ export class Stage {
     settings.y = percent(((newY - column.height / 2) / (column.height / 2)) * 100);
     this.applyLayout(entry, settings);
     this.deps.saveSettingsDebounced();
+    this.deps.layoutChanged();
   }
 
   private onPointerUp(event: PointerEvent): void {

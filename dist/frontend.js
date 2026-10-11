@@ -1404,6 +1404,7 @@ class Stage {
     settings.y = percent((newY - column.height / 2) / (column.height / 2) * 100);
     this.applyLayout(entry, settings);
     this.deps.saveSettingsDebounced();
+    this.deps.layoutChanged();
   }
   onPointerUp(event) {
     const drag = this.drag;
@@ -1818,6 +1819,7 @@ class SettingsUI {
   root = null;
   selectedCharacterId = null;
   lastActiveCharacterId = null;
+  syncLayout = null;
   selectedModelId = null;
   libraryFilter = "";
   libraryList = null;
@@ -1831,6 +1833,9 @@ class SettingsUI {
     this.root = root;
     this.render();
   }
+  layoutChanged() {
+    this.syncLayout?.();
+  }
   render() {
     const root = this.root;
     if (!root)
@@ -1843,6 +1848,7 @@ class SettingsUI {
     this.pendingMounts = [];
     root.replaceChildren();
     root.classList.add("l2d-root");
+    this.syncLayout = null;
     const controller = this.controller;
     const settings = controller.getSettings();
     const globals = settings.global;
@@ -2201,6 +2207,11 @@ Used by ${used} character${used === 1 ? "" : "s"}` : ""}`;
       controller.saveDebounced();
       applyLive();
     });
+    this.syncLayout = () => {
+      scaleSlider.setValue(modelSettings.scale);
+      xSlider.setValue(modelSettings.x);
+      ySlider.setValue(modelSettings.y);
+    };
     const center = () => {
       modelSettings.x = 0;
       modelSettings.y = 0;
@@ -2579,6 +2590,7 @@ function setup(ctx) {
     getModelRecord: (modelId) => models.find((model) => model.id === modelId),
     getModelSettings: getOrCreateModelSettings,
     saveSettingsDebounced: saveDebounced,
+    layoutChanged: () => ui.layoutChanged(),
     assets,
     drawsOverApp: () => overlayActive,
     sendInteraction: (message, characterId) => {
