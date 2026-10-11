@@ -46,15 +46,15 @@ export interface UIController {
   exportModelSettings(characterId: string, characterName: string): void;
   /** Load a settings file onto a character; resolves to a status line ('' when cancelled). */
   importModelSettings(characterId: string, characterName: string): Promise<string>;
-  /** Retake the library thumbnail of the model on stage; false when it isn't shown. */
-  updateThumbnail(modelId: string): boolean;
+  /** Retake the library thumbnail of a character's model on stage; false when it isn't shown. */
+  updateThumbnail(characterId: string, modelId: string): boolean;
 }
 
 const REQUIRED_PERMS: Array<{ id: string; why: string }> = [
   { id: 'app_manipulation', why: 'show the avatar over the app (otherwise it renders inside this tab)' },
   { id: 'generation', why: 'classify message emotions with the LLM' },
   { id: 'chat_mutation', why: 'send hit-area interaction messages' },
-  { id: 'chats', why: 'know which character the active chat belongs to' },
+  { id: 'chats', why: 'know which characters are in the active chat (needed for group chats)' },
   { id: 'characters', why: 'list your characters by name when assigning models' },
 ];
 
@@ -264,6 +264,10 @@ function parameterOptions(description: ModelDescription | null): Array<{ value: 
 export class SettingsUI {
   private root: HTMLElement | null = null;
   private selectedCharacterId: string | null = null;
+  /** The chat's character when the tab last rendered; the selection follows it across chat switches. */
+  private lastActiveCharacterId: string | null = null;
+  /** Refreshes the layout sliders from the stored settings (after a drag on the stage). */
+  private syncLayout: (() => void) | null = null;
   private selectedModelId: string | null = null;
   /** Model library filter text (not saved). */
   private libraryFilter = '';
@@ -283,6 +287,11 @@ export class SettingsUI {
   }
 
   /** Re-render from current state (cheap enough for a settings panel). */
+  /** The stage moved a model (drag); show the new position on the sliders. */
+  layoutChanged(): void {
+    this.syncLayout?.();
+  }
+
   render(): void {
     const root = this.root;
     if (!root) return;
@@ -296,6 +305,7 @@ export class SettingsUI {
     this.pendingMounts = [];
     root.replaceChildren();
     root.classList.add('l2d-root');
+    this.syncLayout = null;
 
     const controller = this.controller;
     const settings = controller.getSettings();
@@ -451,16 +461,35 @@ export class SettingsUI {
     root.appendChild(section('Model library', library));
 
     // ── Character binding ──
-    const characters = [...controller.getCharacters()];
+    const known = controller.getCharacters();
     const activeCharacterId = controller.getActiveCharacterId();
-    if (activeCharacterId && !characters.some((character) => character.id === activeCharacterId)) {
-      characters.unshift({ id: activeCharacterId, name: 'Current chat character' });
+    // The chat's characters come first, marked, in member order.
+    const inChat = controller.stage.getChatContext().characterIds;
+    if (activeCharacterId && !inChat.includes(activeCharacterId)) inChat.unshift(activeCharacterId);
+    const isGroup = inChat.length > 1;
+    const characters = [
+      ...inChat.map((id, index) => {
+        const name = known.find((character) => character.id === id)?.name;
+        const fallback = isGroup ? `Group member ${index + 1}` : 'Current chat character';
+        return { id, name: `${name ?? fallback} (in this chat)` };
+      }),
+      ...known.filter((character) => !inChat.includes(character.id)),
+    ];
+    // Follow the chat: when it switches, move the selection along unless the
+    // user had picked some other character.
+    if (activeCharacterId !== this.lastActiveCharacterId) {
+      if (activeCharacterId && (!this.selectedCharacterId || this.selectedCharacterId === this.lastActiveCharacterId)) {
+        this.selectedCharacterId = activeCharacterId;
+      }
+      this.lastActiveCharacterId = activeCharacterId;
     }
-    if (!this.selectedCharacterId && activeCharacterId) this.selectedCharacterId = activeCharacterId;
-    if (!this.selectedCharacterId && characters.length > 0) this.selectedCharacterId = characters[0]!.id;
+    if (!characters.some((character) => character.id === this.selectedCharacterId)) {
+      this.selectedCharacterId = activeCharacterId ?? characters[0]?.id ?? null;
+    }
 
     const bindingSection = el('div');
     if (characters.length === 0) {
+      this.selectedModelId = null;
       bindingSection.appendChild(
         note('Open a chat (or grant the "characters" permission) to assign a model to a character.'),
       );
@@ -501,15 +530,25 @@ export class SettingsUI {
           if (value === 'none') delete settings.characterModelMapping[characterId];
           else settings.characterModelMapping[characterId] = value;
           controller.saveNow();
-          controller.reloadStage();
+          if (this.isOnStage(characterId)) controller.reloadStage();
           this.render();
         },
         { placeholder: 'No model', searchPlaceholder: 'Search models…', noneLabel: 'No model' },
       );
       bindingSection.appendChild(row('Character', characterSelect));
       bindingSection.appendChild(row('Model', modelSelect));
+      if (isGroup) {
+        bindingSection.appendChild(
+          note(
+            'Group chat: every member with a model is shown. The stage is split into equal columns, one per ' +
+              'member with a model (Live2D or, with the Spine Avatars extension, Spine), in member order. ' +
+              'Scale 1 fits the model in its column; X and Y offset and Fit to canvas work within that column.',
+          ),
+        );
+      }
       const characterName = () =>
-        characters.find((character) => character.id === this.selectedCharacterId)?.name ?? 'Character';
+        characters.find((character) => character.id === this.selectedCharacterId)?.name.replace(/ \(in this chat\)$/, '') ??
+        'Character';
       const fileStatus = el('span', 'l2d-dim', this.fileStatusText);
       const exportButton = button('Export settings', () => {
         if (this.selectedCharacterId) controller.exportModelSettings(this.selectedCharacterId, characterName());
@@ -538,7 +577,7 @@ export class SettingsUI {
             if (!characterId) return;
             delete settings.characterModelsSettings[characterId];
             controller.saveNow();
-            controller.reloadStage();
+            if (this.isOnStage(characterId)) controller.reloadStage();
             this.render();
           }),
         ),
@@ -714,6 +753,11 @@ export class SettingsUI {
     return host;
   }
 
+  /** Whether this character is in the chat on stage (its binding changes show there). */
+  private isOnStage(characterId: string): boolean {
+    return this.controller.stage.getChatContext().characterIds.includes(characterId);
+  }
+
   private renderModelSettings(
     host: HTMLElement,
     characterId: string,
@@ -724,11 +768,11 @@ export class SettingsUI {
     const modelSettings = controller.getOrCreateModelSettings(characterId, modelId, description);
 
     const applyLive = () => {
-      const current = controller.stage.currentModel();
-      if (current && current.characterId === characterId && current.modelId === modelId) {
-        controller.stage.applyLayout();
-        controller.stage.applyCursorParams();
-      }
+      if (controller.stage.isOnStage(characterId, modelId)) controller.stage.applyLayoutFor(characterId);
+    };
+    const play = (mapping: { expression: string; motion: string }) => {
+      void controller.stage.playExpression(characterId, mapping.expression);
+      void controller.stage.playMotion(characterId, mapping.motion, true);
     };
 
     // Layout sliders
@@ -747,6 +791,11 @@ export class SettingsUI {
       controller.saveDebounced();
       applyLive();
     });
+    this.syncLayout = () => {
+      scaleSlider.setValue(modelSettings.scale);
+      xSlider.setValue(modelSettings.x);
+      ySlider.setValue(modelSettings.y);
+    };
     const center = () => {
       modelSettings.x = 0;
       modelSettings.y = 0;
@@ -757,7 +806,7 @@ export class SettingsUI {
     host.appendChild(
       row(
         button('Fit to canvas', () => {
-          const fit = controller.stage.fitScale(description, modelSettings.rotation || 0);
+          const fit = controller.stage.fitScale(characterId, modelId, modelSettings.rotation || 0);
           if (fit === null) {
             fitHint.textContent = 'Show the model first, then try again.';
             return;
@@ -776,7 +825,7 @@ export class SettingsUI {
           applyLive();
         }),
         button('Update thumbnail', () => {
-          fitHint.textContent = controller.updateThumbnail(modelId)
+          fitHint.textContent = controller.updateThumbnail(characterId, modelId)
             ? 'Thumbnail updated.'
             : 'Show the model first, then try again.';
         }),
@@ -852,8 +901,8 @@ export class SettingsUI {
 
     // Animations: starter / default / click
     const animations = el('div');
-    animations.appendChild(this.animationRow('Starter', description, modelSettings.animation_starter, true));
-    const defaultRow = this.animationRow('Default', description, modelSettings.animation_default, false);
+    animations.appendChild(this.animationRow('Starter', characterId, description, modelSettings.animation_starter, true));
+    const defaultRow = this.animationRow('Default', characterId, description, modelSettings.animation_default, false);
     defaultRow.appendChild(
       checkbox('Loop the default animation', modelSettings.animation_default.loop, (value) => {
         modelSettings.animation_default.loop = value;
@@ -868,7 +917,7 @@ export class SettingsUI {
     );
     animations.appendChild(defaultRow);
 
-    const clickRow = this.animationRow('On click', description, modelSettings.animation_click, false);
+    const clickRow = this.animationRow('On click', characterId, description, modelSettings.animation_click, false);
     const clickMessage = el('input', 'l2d-input') as HTMLInputElement;
     clickMessage.type = 'text';
     clickMessage.placeholder = 'Message sent when clicked (optional)';
@@ -896,10 +945,7 @@ export class SettingsUI {
             mapping.motion = value;
             controller.saveDebounced();
           }),
-          button('▶', () => {
-            void controller.stage.playExpression(mapping.expression);
-            void controller.stage.playMotion(mapping.motion, true);
-          }),
+          button('▶', () => play(mapping)),
         ),
       );
     }
@@ -936,10 +982,7 @@ export class SettingsUI {
               controller.saveDebounced();
             }),
             message,
-            button('▶', () => {
-              void controller.stage.playExpression(mapping.expression);
-              void controller.stage.playMotion(mapping.motion, true);
-            }),
+            button('▶', () => play(mapping)),
           ),
         );
       }
@@ -951,6 +994,7 @@ export class SettingsUI {
 
   private animationRow(
     label: string,
+    characterId: string,
     description: ModelDescription,
     mapping: { expression: string; motion: string; delay?: number },
     withDelay: boolean,
@@ -971,8 +1015,8 @@ export class SettingsUI {
           controller.saveDebounced();
         }),
         button('▶', () => {
-          void controller.stage.playExpression(mapping.expression);
-          void controller.stage.playMotion(mapping.motion, true);
+          void controller.stage.playExpression(characterId, mapping.expression);
+          void controller.stage.playMotion(characterId, mapping.motion, true);
         }),
       ),
     );

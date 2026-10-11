@@ -824,22 +824,32 @@ async function classifyExpression(text) {
   }
   return FALLBACK_EXPRESSION;
 }
-async function resolveChatCharacter(chatId, userId) {
+function castFromChat(chat) {
+  const metadata = chat.metadata ?? {};
+  const members = metadata.group === true && Array.isArray(metadata.character_ids) ? metadata.character_ids.filter((id) => typeof id === "string" && id.length > 0) : [];
+  const characterId = chat.character_id ?? members[0] ?? null;
+  return { characterId, characterIds: members.length > 0 ? [...new Set(members)] : characterId ? [characterId] : [] };
+}
+async function resolveChatCast(chatId, userId) {
   if (!spindle.permissions.has("chats"))
     return null;
   try {
     const chat = await spindle.chats.get(chatId, userId);
-    return chat?.character_id ?? null;
+    return chat ? castFromChat(chat) : null;
   } catch {
     return null;
   }
+}
+async function sendChatContext(chatId, userId) {
+  const cast = chatId ? await resolveChatCast(chatId, userId) : null;
+  send({ type: "chat_context", chatId, characterId: cast?.characterId ?? null, characterIds: cast?.characterIds ?? null }, userId);
 }
 async function handleCharacterMessage(chatId, message, userId) {
   const settings = await loadSettings(userId);
   if (!settings.global.enabled)
     return;
   const author = [message.extra?.character_id, message.extra?.greeting_character_id].find((id) => typeof id === "string" && id.length > 0);
-  const characterId = author ?? await resolveChatCharacter(chatId, userId);
+  const characterId = author ?? (await resolveChatCast(chatId, userId))?.characterId ?? null;
   const text = message.content ?? "";
   send({ type: "character_message", chatId, characterId, messageId: message.id, textLength: text.length }, userId);
   if (settings.global.expressionSource !== "llm")
@@ -855,7 +865,10 @@ async function handleInteraction(msg, userId) {
     return;
   }
   try {
-    await spindle.chat.appendMessage(msg.chatId, { role: "user", content: msg.message }, msg.generate ? { triggerGeneration: true } : undefined);
+    await spindle.chat.appendMessage(msg.chatId, { role: "user", content: msg.message }, msg.generate ? {
+      triggerGeneration: true,
+      ...msg.characterId ? { generation: { target_character_id: msg.characterId } } : {}
+    } : undefined);
   } catch (error) {
     spindle.log.warn(`live2d: interaction failed: ${String(error)}`);
     spindle.toast.error(`Live2D interaction failed: ${String(error)}`, userId ? { userId } : undefined);
@@ -905,6 +918,9 @@ spindle.onFrontendMessage(async (payload, userId) => {
       case "interaction":
         await handleInteraction(msg, userId);
         break;
+      case "get_chat_context":
+        await sendChatContext(msg.chatId, userId);
+        break;
       case "classify_test": {
         const label = await classifyExpression(msg.text);
         send({ type: "classify_test_result", label }, userId);
@@ -951,9 +967,20 @@ spindle.on("EXPRESSION_CHANGED", (payload, userId) => {
 });
 spindle.on("CHAT_SWITCHED", (payload, userId) => {
   const event = payload;
+  sendChatContext(event?.chatId ?? null, userId);
+});
+spindle.on("CHAT_CHANGED", (payload, userId) => {
+  const event = payload;
+  const chatId = event?.chat?.id ?? event?.chatId;
+  if (!chatId)
+    return;
+  const fields = event.changedFields;
+  if (fields && !fields.some((field) => /^metadata(\.(group|character_ids)\b|$)/.test(field)))
+    return;
   (async () => {
-    const characterId = event?.chatId ? await resolveChatCharacter(event.chatId, userId) : null;
-    send({ type: "chat_context", chatId: event?.chatId ?? null, characterId }, userId);
+    const cast = event.chat?.metadata ? castFromChat(event.chat) : await resolveChatCast(chatId, userId);
+    if (cast)
+      send({ type: "chat_members", chatId, characterIds: cast.characterIds }, userId);
   })();
 });
 spindle.permissions.onChanged(({ allGranted }) => {

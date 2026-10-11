@@ -1,11 +1,22 @@
 /**
- * The Live2D stage: owns the PIXI application, the loaded model, interaction
+ * The Live2D stage: owns the PIXI applications, the loaded models, interaction
  * (drag, hit areas, cursor following), the talking mouth animation, and
  * expression/motion playback. Ports the behavior of the SillyTavern Live2d
  * extension's live2d.js onto a Lumiverse overlay or embedded container.
+ *
+ * Every character in the chat that has a model gets one: one in a solo chat,
+ * one per member in a group chat, each on its own canvas stacked over the
+ * stage (clipping a model erases pixels, which must not reach the others).
+ * The stage is split into equal columns, one per member with a model, left to
+ * right in member order, and each model is laid out inside its column: X/Y
+ * offsets are a percent of half the column, and Fit to canvas fits the column.
+ * In a group, scale 1 also keeps the model inside its column's width. Members
+ * with a Spine model (from the Spine Avatars extension) get columns too; see
+ * columns.ts.
  */
 
 import type { ModelAssets, ModelBundle } from './assets';
+import { type Columns, SharedColumns, sameColumns } from './columns';
 import { ensureLive2DRuntime } from './runtime';
 import { squareThumbnail, THUMBNAIL_RENDER_PIXELS } from './thumbnail';
 import {
@@ -72,9 +83,13 @@ export interface StageDeps {
     preset?: unknown,
   ): ModelSettings;
   saveSettingsDebounced(): void;
+  /** The stage changed a model's position itself (a drag). */
+  layoutChanged(): void;
   assets: ModelAssets;
-  /** Send a hit-area interaction message into the chat. */
-  sendInteraction(message: string): void;
+  /** Whether the stage draws over the app (rather than in the settings tab), where other avatar extensions draw too. */
+  drawsOverApp(): boolean;
+  /** Send a hit-area interaction message into the chat, from a click on this character's model. */
+  sendInteraction(message: string, characterId: string): void;
   /** Store a model's library thumbnail (an image data URL). */
   saveThumbnail(modelId: string, dataUrl: string): void;
   log(message: string): void;
@@ -84,6 +99,9 @@ interface LoadedEntry {
   characterId: string;
   modelId: string;
   model: any;
+  /** The model's own PIXI application and canvas, the size of the stage. */
+  app: any;
+  canvas: HTMLCanvasElement;
   objectUrls: string[];
   lastMotion: string | null;
   talking: boolean;
@@ -98,6 +116,15 @@ interface LoadedEntry {
   idleGroup: string | undefined;
   /** Motion currently installed as the idle loop, or null when the model's own idle motions play. */
   loopingMotion: string | null;
+  starterTimer: number | null;
+  thumbnailTimer: number | null;
+}
+
+/** A model's column on the stage, in host CSS pixels. */
+interface Column {
+  x: number;
+  width: number;
+  height: number;
 }
 
 function dirname(path: string): string {
@@ -178,16 +205,16 @@ export function describeFromBundle(bundleJson: any, cubism: 2 | 4): Omit<ModelDe
 
 export class Stage {
   private host: HTMLElement | null = null;
-  private canvas: HTMLCanvasElement | null = null;
-  private app: any = null;
-  private loaded: LoadedEntry | null = null;
+  /** Models on stage, left to right. */
+  private loaded: LoadedEntry[] = [];
   private chatId: string | null = null;
-  private characterId: string | null = null;
+  /** Characters in the chat, in member order. */
+  private characterIds: string[] = [];
+  private columns: Columns = { count: 1, index: new Map() };
+  private readonly sharedColumns: SharedColumns;
   private loadToken = 0;
   private ticker: number | null = null;
   private resizeObserver: ResizeObserver | null = null;
-  private starterTimer: number | null = null;
-  private thumbnailTimer: number | null = null;
   private previousInteraction = { characterId: '', message: '' };
   private descriptionCache = new Map<string, ModelDescription>();
   private drag: { entry: LoadedEntry; pointerId: number; offsetX: number; offsetY: number; moved: boolean } | null =
@@ -210,6 +237,7 @@ export class Stage {
 
   constructor(private deps: StageDeps) {
     for (const [target, type, listener, options] of this.listeners) target.addEventListener(type, listener, options);
+    this.sharedColumns = new SharedColumns('live2d_avatars', () => this.updateColumns());
   }
 
   destroy(): void {
@@ -220,8 +248,8 @@ export class Stage {
     this.hoverFrame = null;
     this.setHovering(false);
     this.teardownApp();
+    this.sharedColumns.destroy();
     if (this.ticker !== null) window.clearInterval(this.ticker);
-    if (this.starterTimer !== null) window.clearTimeout(this.starterTimer);
     this.ticker = null;
   }
 
@@ -233,83 +261,148 @@ export class Stage {
     void this.reload();
   }
 
-  setChatContext(chatId: string | null, characterId: string | null): void {
-    const changed = chatId !== this.chatId || characterId !== this.characterId;
+  /** Show the models of these characters (the chat's members, in order). */
+  setChatContext(chatId: string | null, characterIds: string[]): void {
+    const unique = [...new Set(characterIds.filter(Boolean))];
+    const changed =
+      chatId !== this.chatId ||
+      unique.length !== this.characterIds.length ||
+      unique.some((id, index) => id !== this.characterIds[index]);
     this.chatId = chatId;
-    this.characterId = characterId;
+    this.characterIds = unique;
     if (changed) void this.reload();
   }
 
-  getChatContext(): { chatId: string | null; characterId: string | null } {
-    return { chatId: this.chatId, characterId: this.characterId };
+  getChatContext(): { chatId: string | null; characterIds: string[] } {
+    return { chatId: this.chatId, characterIds: [...this.characterIds] };
   }
 
-  currentModel(): { characterId: string; modelId: string } | null {
-    return this.loaded ? { characterId: this.loaded.characterId, modelId: this.loaded.modelId } : null;
+  /** Whether this character's model is loaded and drawn (optionally: this particular model). */
+  isOnStage(characterId: string, modelId?: string): boolean {
+    const entry = this.entryFor(characterId);
+    return entry !== undefined && (modelId === undefined || entry.modelId === modelId);
+  }
+
+  /** Characters whose models are on stage, left to right. */
+  charactersOnStage(): string[] {
+    return this.loaded.map((entry) => entry.characterId);
+  }
+
+  private entryFor(characterId: string): LoadedEntry | undefined {
+    return this.loaded.find((entry) => entry.characterId === characterId);
+  }
+
+  /** Characters with a model in the library, by character. */
+  private boundCharacters(settings: Live2DSettings): Map<string, ModelRecord> {
+    const bound = new Map<string, ModelRecord>();
+    if (!settings.global.enabled) return bound;
+    for (const [characterId, modelId] of Object.entries(settings.characterModelMapping)) {
+      const record = modelId ? this.deps.getModelRecord(modelId) : undefined;
+      if (record) bound.set(characterId, record);
+    }
+    return bound;
+  }
+
+  /**
+   * Share which characters have a model here with the other avatar extension,
+   * and lay the models out again if the columns changed.
+   */
+  private updateColumns(): void {
+    const own = [...this.boundCharacters(this.deps.getSettings()).keys()];
+    const overApp = this.host !== null && this.deps.drawsOverApp();
+    this.sharedColumns.publish(overApp ? own : []);
+    const columns = this.sharedColumns.layout(this.characterIds, own, overApp);
+    if (sameColumns(columns, this.columns)) return;
+    this.columns = columns;
+    this.sortEntries();
+    for (const entry of this.loaded) this.applyLayout(entry);
   }
 
   /** Rebuild the whole stage from current settings + chat context. */
   async reload(): Promise<void> {
     this.teardownApp(); // bumps loadToken, cancelling any in-flight load
-    const token = ++this.loadToken;
+    const token = this.loadToken;
+    this.updateColumns();
 
     const settings = this.deps.getSettings();
-    if (!settings.global.enabled || !this.host || !this.characterId) return;
-    const modelId = settings.characterModelMapping[this.characterId];
-    if (!modelId) return;
-    const record = this.deps.getModelRecord(modelId);
-    if (!record) return;
+    if (!settings.global.enabled || !this.host) return;
+    const bound = this.boundCharacters(settings);
+    const cast = this.characterIds.flatMap((characterId) => {
+      const record = bound.get(characterId);
+      return record ? [{ characterId, record }] : [];
+    });
+    if (cast.length === 0) return;
 
     let PIXI: any;
-    let bundle: ModelBundle;
     try {
-      [PIXI, bundle] = await Promise.all([ensureLive2DRuntime(), this.deps.assets.load(record)]);
+      PIXI = await ensureLive2DRuntime();
     } catch (error) {
-      this.deps.log(`Failed to prepare model: ${String(error)}`);
+      this.deps.log(`Failed to prepare the Live2D runtime: ${String(error)}`);
       return;
     }
     if (token !== this.loadToken || !this.host) return;
 
-    const canvas = document.createElement('canvas');
-    canvas.className = 'live2d-avatars-canvas';
-    this.host.appendChild(canvas);
-    this.canvas = canvas;
-    const hostRect = this.host.getBoundingClientRect();
-    if (hostRect.width === 0 || hostRect.height === 0) {
-      this.deps.log(`Stage host has no size yet (${hostRect.width}x${hostRect.height}); waiting for it to be shown.`);
-    }
+    // Each model appears as soon as it's ready; one failing doesn't stop the others.
+    await Promise.all(
+      cast.map(async ({ characterId, record }) => {
+        let bundle: ModelBundle;
+        try {
+          bundle = await this.deps.assets.load(record);
+        } catch (error) {
+          this.deps.log(`Failed to download model "${record.name}": ${String(error)}`);
+          return;
+        }
+        if (token !== this.loadToken || !this.host) return;
+        try {
+          await this.loadModel(PIXI, characterId, record, bundle, token);
+        } catch (error) {
+          if (token === this.loadToken) this.deps.log(`Failed to load model "${record.name}": ${String(error)}`);
+        }
+      }),
+    );
 
-    this.app = new PIXI.Application({
-      resolution: 2 * (window.devicePixelRatio || 1),
-      view: canvas,
-      autoStart: true,
-      resizeTo: this.host,
-      backgroundAlpha: 0,
-    });
-    // PIXI's resizeTo only reacts to window resizes; the host can also change
-    // size on its own (a drawer tab opening, a panel resizing).
-    this.resizeObserver = new ResizeObserver(() => {
-      if (!this.app) return;
-      this.app.resize();
-      this.applyLayout();
-    });
-    this.resizeObserver.observe(this.host);
-
-    try {
-      await this.loadModel(PIXI, record, bundle, token);
-    } catch (error) {
-      this.deps.log(`Failed to load model "${record.name}": ${String(error)}`);
-      this.teardownApp();
-      return;
-    }
-
-    if (this.ticker === null) {
+    if (token === this.loadToken && this.loaded.length > 0 && this.ticker === null) {
       this.ticker = window.setInterval(() => this.tick(), 100);
     }
   }
 
-  private async loadModel(PIXI: any, record: ModelRecord, bundle: ModelBundle, token: number): Promise<void> {
-    const characterId = this.characterId!;
+  /** A canvas and PIXI application for one model, filling the stage. */
+  private createApp(PIXI: any, host: HTMLElement): { app: any; canvas: HTMLCanvasElement } {
+    const canvas = document.createElement('canvas');
+    canvas.className = 'live2d-avatars-canvas';
+    host.appendChild(canvas);
+    const hostRect = host.getBoundingClientRect();
+    if (hostRect.width === 0 || hostRect.height === 0) {
+      this.deps.log(`Stage host has no size yet (${hostRect.width}x${hostRect.height}); waiting for it to be shown.`);
+    }
+    const app = new PIXI.Application({
+      resolution: 2 * (window.devicePixelRatio || 1),
+      view: canvas,
+      autoStart: true,
+      resizeTo: host,
+      backgroundAlpha: 0,
+    });
+    if (!this.resizeObserver) {
+      // PIXI's resizeTo only reacts to window resizes; the host can also change
+      // size on its own (a drawer tab opening, a panel resizing).
+      this.resizeObserver = new ResizeObserver(() => {
+        for (const entry of this.loaded) {
+          entry.app.resize();
+          this.applyLayout(entry);
+        }
+      });
+      this.resizeObserver.observe(host);
+    }
+    return { app, canvas };
+  }
+
+  private async loadModel(
+    PIXI: any,
+    characterId: string,
+    record: ModelRecord,
+    bundle: ModelBundle,
+    token: number,
+  ): Promise<void> {
     const settingsText = await bundle.files.get(bundle.settingsFile)?.text();
     if (!settingsText) throw new Error(`Settings file missing from bundle: ${bundle.settingsFile}`);
     const json = JSON.parse(settingsText);
@@ -321,7 +414,8 @@ export class Stage {
     const modelSettings = this.deps.getModelSettings(characterId, record.id, baseDescription, bundle.presetSettings);
 
     const { model, objectUrls } = await this.instantiate(PIXI, bundle, json, modelSettings.eye);
-    if (token !== this.loadToken || !this.app) {
+    const host = this.host;
+    if (token !== this.loadToken || !host) {
       model.destroy(true, true, true);
       objectUrls.forEach((url) => URL.revokeObjectURL(url));
       return;
@@ -336,10 +430,14 @@ export class Stage {
     this.descriptionCache.set(`${record.id}@${record.version}`, description);
     this.autoDetectParameters(modelSettings, description.parameterIds);
 
+    const { app, canvas } = this.createApp(PIXI, host);
+    app.stage.addChild(model);
     const entry: LoadedEntry = {
       characterId,
       modelId: record.id,
       model,
+      app,
+      canvas,
       objectUrls,
       lastMotion: null,
       talking: false,
@@ -350,10 +448,13 @@ export class Stage {
       expressionAt: 0,
       idleGroup: model.internalModel.motionManager?.groups?.idle,
       loopingMotion: null,
+      starterTimer: null,
+      thumbnailTimer: null,
     };
-    this.loaded = entry;
+    // Owned by the stage from here on, so teardown frees it.
+    this.loaded.push(entry);
+    this.sortEntries();
 
-    this.app.stage.addChild(model);
     this.applyCursorParams(entry, modelSettings);
     this.applyLayout(entry, modelSettings);
     if (this.deps.getSettings().global.showFrames) this.showFrames(entry, true);
@@ -361,34 +462,46 @@ export class Stage {
     // Starter animation
     const starter = modelSettings.animation_starter;
     if (starter.expression !== 'none' || starter.motion !== 'none') {
-      this.starterTimer = window.setTimeout(() => {
-        if (this.loaded !== entry) return;
-        if (starter.expression !== 'none') void this.playExpression(starter.expression);
-        if (starter.motion !== 'none') void this.playMotion(starter.motion);
+      entry.starterTimer = window.setTimeout(() => {
+        entry.starterTimer = null;
+        if (!this.loaded.includes(entry)) return;
+        if (starter.expression !== 'none') void this.playExpression(characterId, starter.expression);
+        if (starter.motion !== 'none') void this.playMotion(characterId, starter.motion);
       }, Math.max(0, starter.delay));
     }
 
     // A model's first appearance gives the library its thumbnail.
     if (!record.thumbnail) {
-      this.thumbnailTimer = window.setTimeout(() => {
-        this.thumbnailTimer = null;
-        if (this.loaded !== entry || this.deps.getModelRecord(record.id)?.thumbnail) return;
-        const dataUrl = this.captureThumbnail();
+      entry.thumbnailTimer = window.setTimeout(() => {
+        entry.thumbnailTimer = null;
+        if (!this.loaded.includes(entry) || this.deps.getModelRecord(record.id)?.thumbnail) return;
+        const dataUrl = this.captureThumbnail(characterId);
         if (dataUrl) this.deps.saveThumbnail(record.id, dataUrl);
       }, THUMBNAIL_DELAY_MS);
     }
   }
 
+  /** Keep the models in column order, for stacking and for hit-testing (rightmost on top). */
+  private sortEntries(): void {
+    const column = (entry: LoadedEntry) => this.columns.index.get(entry.characterId) ?? 0;
+    this.loaded.sort((a, b) => column(a) - column(b));
+    const host = this.host;
+    if (!host) return;
+    for (const entry of this.loaded) {
+      if (entry.canvas.parentElement === host) host.appendChild(entry.canvas);
+    }
+  }
+
   /**
-   * A square picture of the model on stage, upright and centered, as an image
-   * data URL; null when no model is shown. The model is drawn once more into
-   * the canvas's corner, copied, and put back, all before the browser shows
-   * the canvas again, so nothing flickers.
+   * A square picture of a character's model, upright and centered, as an image
+   * data URL; null when it isn't on stage. The model is drawn alone once more
+   * into the canvas's corner, copied, and put back, all before the browser
+   * shows the canvas again, so nothing flickers.
    */
-  captureThumbnail(): string | null {
-    const entry = this.loaded;
-    const app = this.app;
-    if (!entry || !app) return null;
+  captureThumbnail(characterId: string): string | null {
+    const entry = this.entryFor(characterId);
+    if (!entry) return null;
+    const app = entry.app;
     const view: HTMLCanvasElement = app.view;
     const pixels = Math.min(THUMBNAIL_RENDER_PIXELS, view.width, view.height);
     if (pixels < 32) return null;
@@ -490,9 +603,9 @@ export class Stage {
     if (changed) this.deps.saveSettingsDebounced();
   }
 
-  getDescription(): ModelDescription | null {
-    if (!this.loaded) return null;
-    const record = this.deps.getModelRecord(this.loaded.modelId);
+  getDescription(characterId: string): ModelDescription | null {
+    const entry = this.entryFor(characterId);
+    const record = entry ? this.deps.getModelRecord(entry.modelId) : undefined;
     if (!record) return null;
     return this.descriptionCache.get(`${record.id}@${record.version}`) ?? null;
   }
@@ -507,10 +620,11 @@ export class Stage {
     const json = JSON.parse(settingsText);
     const partial = describeFromBundle(json, bundle.cubism);
 
-    // Reuse the live instance when it's the same model — no need to load twice.
-    if (this.loaded?.modelId === record.id) {
-      const parameterIds: string[] = this.loaded.model.internalModel.coreModel?._model?.parameters?.ids ?? [];
-      const description = { ...partial, parameterIds: [...parameterIds].sort(), size: modelSize(this.loaded.model) };
+    // Reuse a live instance when it's the same model — no need to load twice.
+    const live = this.loaded.find((entry) => entry.modelId === record.id);
+    if (live) {
+      const parameterIds: string[] = live.model.internalModel.coreModel?._model?.parameters?.ids ?? [];
+      const description = { ...partial, parameterIds: [...parameterIds].sort(), size: modelSize(live.model) };
       this.descriptionCache.set(`${record.id}@${record.version}`, description);
       return description;
     }
@@ -532,38 +646,68 @@ export class Stage {
     return { width: rect?.width ?? 0, height: rect?.height ?? 0 };
   }
 
-  /**
-   * The `scale` setting at which the model's whole canvas, rotated by
-   * `rotation` degrees, just fits the stage. Null while the stage is hidden.
-   */
-  fitScale(description: ModelDescription, rotation: number): number | null {
+  /** The model's column for the current stage size. */
+  private columnOf(entry: LoadedEntry): Column {
     const { width, height } = this.hostSize();
-    if (width === 0 || height === 0 || !description.size) return null;
-    const { width: w, height: h } = description.size;
+    const columnWidth = width / Math.max(1, this.columns.count);
+    return { x: columnWidth * (this.columns.index.get(entry.characterId) ?? 0), width: columnWidth, height };
+  }
+
+  /**
+   * Pixels per model unit at scale 1: the model's height fills its column's
+   * height. In a group chat the model's width also has to fit its column.
+   */
+  private unitScale(column: Column, size: { width: number; height: number }): number {
+    const byHeight = column.height / size.height;
+    return this.columns.count > 1 ? Math.min(byHeight, column.width / size.width) : byHeight;
+  }
+
+  private settingsFor(entry: LoadedEntry): ModelSettings {
+    return this.deps.getModelSettings(entry.characterId, entry.modelId, this.getDescription(entry.characterId));
+  }
+
+  /**
+   * The `scale` setting at which a character's whole model canvas, rotated by
+   * `rotation` degrees, just fits its column. Null while the model isn't on
+   * stage or the stage is hidden.
+   */
+  fitScale(characterId: string, modelId: string, rotation: number): number | null {
+    const entry = this.entryFor(characterId);
+    if (!entry || entry.modelId !== modelId) return null;
+    const column = this.columnOf(entry);
+    if (column.width === 0 || column.height === 0) return null;
+    const size = modelSize(entry.model);
     const angle = (rotation * Math.PI) / 180;
     const cos = Math.abs(Math.cos(angle));
     const sin = Math.abs(Math.sin(angle));
     // Pixels per model unit that fit the rotated bounding box in both directions.
-    const pixelsPerUnit = Math.min(width / (w * cos + h * sin), height / (w * sin + h * cos));
-    // applyLayout's scale 1 maps the model's height to the stage height.
-    return pixelsPerUnit / (height / h);
+    const pixelsPerUnit = Math.min(
+      column.width / (size.width * cos + size.height * sin),
+      column.height / (size.width * sin + size.height * cos),
+    );
+    return pixelsPerUnit / this.unitScale(column, size);
   }
 
-  applyLayout(entry: LoadedEntry | null = this.loaded, modelSettings?: ModelSettings): void {
+  /** Lay a character's model out again after its settings change. */
+  applyLayoutFor(characterId: string): void {
+    const entry = this.entryFor(characterId);
     if (!entry) return;
-    const settings =
-      modelSettings ?? this.deps.getModelSettings(entry.characterId, entry.modelId, this.getDescription());
-    const { width, height } = this.hostSize();
+    this.applyLayout(entry);
+    this.applyCursorParams(entry);
+  }
+
+  private applyLayout(entry: LoadedEntry, modelSettings?: ModelSettings): void {
+    const settings = modelSettings ?? this.settingsFor(entry);
+    const column = this.columnOf(entry);
     // Hidden host (e.g. closed drawer tab): lay out once the resize observer reports a size.
-    if (width === 0 || height === 0) return;
-    const internalHeight = entry.model.internalModel?.height || entry.model.height || 1;
-    entry.model.scale.set((height / internalHeight) * settings.scale);
+    if (column.width === 0 || column.height === 0) return;
+    entry.model.scale.set(this.unitScale(column, modelSize(entry.model)) * settings.scale);
     // Position and rotate around the model's center. At 0° this matches the
     // old top-left placement, so stored x/y offsets keep their meaning.
     entry.model.anchor.set(0.5, 0.5);
     entry.model.rotation = ((settings.rotation || 0) * Math.PI) / 180;
-    entry.model.x = width / 2 + ((width / 2) * settings.x) / 100;
-    entry.model.y = height / 2 + ((height / 2) * settings.y) / 100;
+    entry.model.x = column.x + column.width / 2 + ((column.width / 2) * settings.x) / 100;
+    entry.model.y = column.height / 2 + ((column.height / 2) * settings.y) / 100;
     this.applyClip(entry, settings.clip_to_canvas);
   }
 
@@ -573,7 +717,8 @@ export class Stage {
    * leaves an opaque frame around the model. The Cubism renderer turns off
    * scissor and stencil tests, so PIXI masks can't clip it; instead a child
    * drawn after the model erases the stage's pixels everywhere outside the
-   * canvas rectangle, in the model's own (rotated, scaled) coordinates.
+   * canvas rectangle, in the model's own (rotated, scaled) coordinates. Each
+   * model has its own canvas, so the eraser doesn't reach the others.
    */
   private applyClip(entry: LoadedEntry, clip: boolean): void {
     const PIXI = window.PIXI;
@@ -601,10 +746,9 @@ export class Stage {
     entry.clip = eraser;
   }
 
-  applyCursorParams(entry: LoadedEntry | null = this.loaded, modelSettings?: ModelSettings): void {
-    if (!entry?.model?.internalModel) return;
-    const settings =
-      modelSettings ?? this.deps.getModelSettings(entry.characterId, entry.modelId, this.getDescription());
+  private applyCursorParams(entry: LoadedEntry, modelSettings?: ModelSettings): void {
+    if (!entry.model?.internalModel) return;
+    const settings = modelSettings ?? this.settingsFor(entry);
     for (const [param, value] of Object.entries(settings.cursor_param)) {
       if (value !== 'none') {
         try {
@@ -620,25 +764,29 @@ export class Stage {
   // ── Interaction ───────────────────────────────────────────────────────────
 
   /**
-   * Whether a pointer event at this position belongs to the model: the model's
+   * The model a pointer event at this position belongs to, or null: the
    * canvas must be the topmost layer there (no drawer or modal above it), the
    * element underneath must not be a control (input, button, link…), and the
-   * point must fall on one of the model's visible drawn parts.
+   * point must fall on one of a model's visible drawn parts. Where models
+   * overlap, the one drawn on top wins.
    */
-  private isModelInteraction(event: PointerEvent): boolean {
-    const entry = this.loaded;
-    const canvas = this.canvas;
-    if (!entry || !canvas) return false;
+  private modelAt(event: PointerEvent): LoadedEntry | null {
+    if (this.loaded.length === 0) return null;
     const target = event.target instanceof Element ? event.target : null;
-    if (target?.closest(INTERACTIVE_SELECTOR)) return false;
+    if (target?.closest(INTERACTIVE_SELECTOR)) return null;
 
-    const previous = canvas.style.pointerEvents;
-    canvas.style.pointerEvents = 'auto';
+    const canvases = this.loaded.map((entry) => entry.canvas);
+    for (const canvas of canvases) canvas.style.pointerEvents = 'auto';
     const topmost = document.elementFromPoint(event.clientX, event.clientY);
-    canvas.style.pointerEvents = previous;
-    if (topmost !== canvas) return false;
+    for (const canvas of canvases) canvas.style.pointerEvents = '';
+    if (!(topmost instanceof HTMLCanvasElement) || !canvases.includes(topmost)) return null;
 
-    return this.isOverModel(entry, this.toStagePoint(event));
+    const point = this.toStagePoint(event);
+    for (let i = this.loaded.length - 1; i >= 0; i--) {
+      const entry = this.loaded[i]!;
+      if (this.isOverModel(entry, point)) return entry;
+    }
+    return null;
   }
 
   private isOverModel(entry: LoadedEntry, point: { x: number; y: number }): boolean {
@@ -676,8 +824,9 @@ export class Stage {
   }
 
   private onPointerDown(event: PointerEvent): void {
-    if (event.button !== 0 || !this.isModelInteraction(event)) return;
-    const entry = this.loaded!;
+    if (event.button !== 0) return;
+    const entry = this.modelAt(event);
+    if (!entry) return;
     event.preventDefault();
     event.stopPropagation();
     const point = this.toStagePoint(event);
@@ -699,40 +848,46 @@ export class Stage {
       this.dragTo(drag, event);
       return;
     }
-    if (!this.loaded) return;
+    if (this.loaded.length === 0) return;
     if (this.deps.getSettings().global.followCursor) {
-      const rect = this.canvas?.getBoundingClientRect();
+      const rect = this.host?.getBoundingClientRect();
       if (rect) {
-        try {
-          this.loaded.model.focus(event.clientX - rect.left, event.clientY - rect.top);
-        } catch {
-          /* model without focus controller */
+        for (const entry of this.loaded) {
+          try {
+            entry.model.focus(event.clientX - rect.left, event.clientY - rect.top);
+          } catch {
+            /* model without focus controller */
+          }
         }
       }
     }
     if (event.pointerType === 'mouse' && this.hoverFrame === null) {
       this.hoverFrame = window.requestAnimationFrame(() => {
         this.hoverFrame = null;
-        this.setHovering(this.isModelInteraction(event));
+        this.setHovering(this.modelAt(event) !== null);
       });
     }
   }
 
   private dragTo(drag: NonNullable<Stage['drag']>, event: PointerEvent): void {
     const { entry } = drag;
+    if (!this.loaded.includes(entry)) return;
+    const column = this.columnOf(entry);
+    if (column.width === 0 || column.height === 0) return;
     const point = this.toStagePoint(event);
     const newX = point.x - drag.offsetX;
     const newY = point.y - drag.offsetY;
     if (!drag.moved && Math.abs(newX - entry.model.x) < 3 && Math.abs(newY - entry.model.y) < 3) return;
     drag.moved = true;
-    entry.model.x = newX;
-    entry.model.y = newY;
-    // Persist as percent offsets from center (model.x/y is the center: anchor 0.5)
-    const { width, height } = this.hostSize();
-    const settings = this.deps.getModelSettings(entry.characterId, entry.modelId, this.getDescription());
-    settings.x = Math.round((entry.model.x - width / 2) / (width / 2 / 100));
-    settings.y = Math.round((entry.model.y - height / 2) / (height / 2 / 100));
+    // Persist as percent offsets of the model's center (anchor 0.5) from its
+    // column's center, within the offset sliders' range.
+    const settings = this.settingsFor(entry);
+    const percent = (value: number) => Math.min(100, Math.max(-100, Math.round(value)));
+    settings.x = percent(((newX - column.x - column.width / 2) / (column.width / 2)) * 100);
+    settings.y = percent(((newY - column.height / 2) / (column.height / 2)) * 100);
+    this.applyLayout(entry, settings);
     this.deps.saveSettingsDebounced();
+    this.deps.layoutChanged();
   }
 
   private onPointerUp(event: PointerEvent): void {
@@ -741,7 +896,7 @@ export class Stage {
     event.preventDefault();
     event.stopPropagation();
     this.endDrag();
-    if (!drag.moved && this.loaded === drag.entry) void this.onModelClick(drag.entry, event);
+    if (!drag.moved && this.loaded.includes(drag.entry)) void this.onModelClick(drag.entry, event);
   }
 
   private endDrag(): void {
@@ -767,7 +922,7 @@ export class Stage {
   }
 
   private toStagePoint(event: PointerEvent): { x: number; y: number } {
-    const rect = this.canvas?.getBoundingClientRect();
+    const rect = this.host?.getBoundingClientRect();
     return { x: event.clientX - (rect?.left ?? 0), y: event.clientY - (rect?.top ?? 0) };
   }
 
@@ -779,7 +934,7 @@ export class Stage {
     } catch {
       hits = [];
     }
-    const settings = this.deps.getModelSettings(entry.characterId, entry.modelId, this.getDescription());
+    const settings = this.settingsFor(entry);
     const modelHitAreas = entry.model.internalModel?.hitAreas ?? {};
 
     // Pick the mapped hit area with the highest priority (lowest index), as ST does.
@@ -806,31 +961,31 @@ export class Stage {
         this.deps.log('Same as last interaction, message not sent again.');
       } else {
         this.previousInteraction = { characterId: entry.characterId, message: mapping.message };
-        this.deps.sendInteraction(mapping.message);
+        this.deps.sendInteraction(mapping.message, entry.characterId);
       }
     }
 
-    if (mapping.expression !== 'none') await this.playExpression(mapping.expression);
-    if (mapping.motion !== 'none') await this.playMotion(mapping.motion);
+    if (mapping.expression !== 'none') await this.playExpression(entry.characterId, mapping.expression);
+    if (mapping.motion !== 'none') await this.playMotion(entry.characterId, mapping.motion);
   }
 
   private tick(): void {
-    const entry = this.loaded;
-    if (!entry) return;
     const globals = this.deps.getSettings().global;
-    if (globals.force_loop && entry.lastMotion) {
-      try {
-        if (!entry.model.internalModel.motionManager.playing) {
-          void this.playMotion(entry.lastMotion);
+    for (const entry of this.loaded) {
+      if (globals.force_loop && entry.lastMotion) {
+        try {
+          if (!entry.model.internalModel.motionManager.playing) {
+            void this.playMotion(entry.characterId, entry.lastMotion);
+          }
+        } catch {
+          /* mid-reload */
         }
+      }
+      try {
+        this.loopDefault(entry);
       } catch {
         /* mid-reload */
       }
-    }
-    try {
-      this.loopDefault(entry);
-    } catch {
-      /* mid-reload */
     }
   }
 
@@ -867,14 +1022,14 @@ export class Stage {
     const state = manager.state;
     if (Math.max(state.currentPriority, state.reservePriority) > MOTION_PRIORITY_IDLE) return;
     if (performance.now() - entry.expressionAt < EXPRESSION_HOLD_MS) return;
-    void this.playExpression(mapping.expression);
+    void this.playExpression(entry.characterId, mapping.expression);
   }
 
   // ── Playback ──────────────────────────────────────────────────────────────
 
-  async playExpression(expression: string): Promise<void> {
-    if (!this.loaded || expression === 'none') return;
-    const entry = this.loaded;
+  async playExpression(characterId: string, expression: string): Promise<void> {
+    const entry = this.entryFor(characterId);
+    if (!entry || expression === 'none') return;
     try {
       await entry.model.expression(expression);
       entry.expression = expression;
@@ -884,13 +1039,13 @@ export class Stage {
     }
   }
 
-  async playMotion(motion: string, force = false): Promise<void> {
-    if (!this.loaded || motion === 'none') return;
+  async playMotion(characterId: string, motion: string, force = false): Promise<void> {
+    if (!this.entryFor(characterId) || motion === 'none') return;
     if (force || this.deps.getSettings().global.force_animation) {
       await this.reload();
-      if (!this.loaded) return;
     }
-    const entry = this.loaded;
+    const entry = this.entryFor(characterId);
+    if (!entry) return;
     const split = motion.split('_id=');
     const group = split[0] ?? motion;
     const id = split[1];
@@ -904,28 +1059,29 @@ export class Stage {
   }
 
   /** Message-length-driven mouth animation, same shape as the ST extension. */
-  async playTalk(textLength: number): Promise<void> {
-    const entry = this.loaded;
+  async playTalk(characterId: string, textLength: number): Promise<void> {
+    const entry = this.entryFor(characterId);
     if (!entry || textLength <= 0) return;
-    const settings = this.deps.getModelSettings(entry.characterId, entry.modelId, this.getDescription());
+    const settings = this.settingsFor(entry);
     const paramId = settings.param_mouth_open_y_id;
     if (paramId === 'none') return;
     const core = entry.model.internalModel?.coreModel;
     if (typeof core?.addParameterValueById !== 'function') return;
 
+    const live = () => this.loaded.includes(entry);
     if (entry.talking) {
       entry.abortTalk = true;
-      while (entry.talking && this.loaded === entry) await delay(50);
+      while (entry.talking && live()) await delay(50);
       entry.abortTalk = false;
     }
-    if (this.loaded !== entry) return;
+    if (!live()) return;
 
     entry.talking = true;
     const start = Date.now();
     const duration = textLength * settings.mouth_time_per_character;
     try {
       while (Date.now() - start < duration) {
-        if (entry.abortTalk || this.loaded !== entry) break;
+        if (entry.abortTalk || !live()) break;
         const coreModel = entry.model?.internalModel?.coreModel;
         if (!coreModel) break;
         coreModel.addParameterValueById(paramId, Math.sin(Date.now() - start));
@@ -939,29 +1095,8 @@ export class Stage {
     }
   }
 
-  setParameter(parameterId: string, value: number): void {
-    try {
-      this.loaded?.model.internalModel.coreModel.setParameterValueById(parameterId, value);
-    } catch (error) {
-      this.deps.log(`Set parameter failed: ${String(error)}`);
-    }
-  }
-
-  resetParameters(): void {
-    const core = this.loaded?.model?.internalModel?.coreModel;
-    const defaults = core?._model?.parameters?.defaultValues;
-    if (!core || !defaults) return;
-    defaults.forEach((value: number, index: number) => {
-      try {
-        core.setParameterValueByIndex(index, value);
-      } catch {
-        /* out-of-range */
-      }
-    });
-  }
-
   setShowFrames(show: boolean): void {
-    if (this.loaded) this.showFrames(this.loaded, show);
+    for (const entry of this.loaded) this.showFrames(entry, show);
   }
 
   private showFrames(entry: LoadedEntry, show: boolean): void {
@@ -994,37 +1129,31 @@ export class Stage {
 
   private teardownApp(): void {
     this.loadToken++;
+    // A press that started on a model won't get its pointerup handled now,
+    // so don't leave the next click anywhere swallowed.
+    if (this.drag) this.suppressClick = false;
     this.drag = null;
     this.setHovering(false);
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
-    if (this.starterTimer !== null) {
-      window.clearTimeout(this.starterTimer);
-      this.starterTimer = null;
-    }
-    if (this.thumbnailTimer !== null) {
-      window.clearTimeout(this.thumbnailTimer);
-      this.thumbnailTimer = null;
-    }
-    if (this.loaded) {
-      this.loaded.abortTalk = true;
+    const entries = this.loaded;
+    this.loaded = [];
+    for (const entry of entries) {
+      if (entry.starterTimer !== null) window.clearTimeout(entry.starterTimer);
+      if (entry.thumbnailTimer !== null) window.clearTimeout(entry.thumbnailTimer);
+      entry.abortTalk = true;
       try {
-        this.loaded.model.destroy(true, true, true);
+        entry.model.destroy(true, true, true);
       } catch {
         /* already destroyed */
       }
-      this.loaded.objectUrls.forEach((url) => URL.revokeObjectURL(url));
-      this.loaded = null;
-    }
-    if (this.app) {
+      entry.objectUrls.forEach((url) => URL.revokeObjectURL(url));
       try {
-        this.app.destroy();
+        entry.app.destroy();
       } catch {
         /* already destroyed */
       }
-      this.app = null;
+      entry.canvas.remove();
     }
-    this.canvas?.remove();
-    this.canvas = null;
   }
 }
