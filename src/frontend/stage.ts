@@ -161,6 +161,10 @@ function dropEmptyFileReferences(json: any, cubism: 2 | 4): void {
   }
 }
 
+/** How far inside the model canvas the clip cuts: a fraction of its shorter side, and a floor in CSS pixels. */
+const CLIP_INSET = 0.004;
+const CLIP_INSET_PX = 2;
+
 function modelSize(model: any): { width: number; height: number } {
   return {
     width: model.internalModel?.width || 1,
@@ -730,20 +734,31 @@ export class Stage {
       }
       return;
     }
-    if (entry.clip) return;
     const { width: w, height: h } = modelSize(entry.model);
-    const far = 100 * Math.max(w, h);
-    const eraser = new PIXI.Graphics();
+    // The art at the very edge of a canvas is usually soft or slightly short of
+    // it, so cutting exactly on the edge leaves a thin line of half-transparent
+    // pixels and backdrop showing through. Cut a little inside instead: a sliver
+    // of the canvas, and never less than a couple of screen pixels.
+    const pixelsPerUnit = Math.abs(entry.model.scale.x) || 1;
+    const inset = Math.min(Math.max(CLIP_INSET * Math.min(w, h), CLIP_INSET_PX / pixelsPerUnit), Math.min(w, h) / 4);
+    if (entry.clip && Math.abs(entry.clip.inset - inset) <= inset * 0.1) return;
+    const eraser = entry.clip ?? new PIXI.Graphics();
+    eraser.clear();
     eraser.blendMode = PIXI.BLEND_MODES.ERASE;
+    const far = 100 * Math.max(w, h);
+    const [left, top, right, bottom] = [inset, inset, w - inset, h - inset];
     eraser.beginFill(0xffffff, 1);
-    eraser.drawRect(-far, -far, w + 2 * far, far); // above
-    eraser.drawRect(-far, h, w + 2 * far, far); // below
-    eraser.drawRect(-far, 0, far, h); // left
-    eraser.drawRect(w, 0, far, h); // right
+    eraser.drawRect(-far, -far, w + 2 * far, far + top); // above
+    eraser.drawRect(-far, bottom, w + 2 * far, far + h - bottom); // below
+    eraser.drawRect(-far, top, far + left, bottom - top); // left
+    eraser.drawRect(right, top, far + w - right, bottom - top); // right
     eraser.endFill();
-    // Children render after the model itself; keep it under any debug frames.
-    entry.model.addChildAt(eraser, 0);
-    entry.clip = eraser;
+    eraser.inset = inset;
+    if (!entry.clip) {
+      // Children render after the model itself; keep it under any debug frames.
+      entry.model.addChildAt(eraser, 0);
+      entry.clip = eraser;
+    }
   }
 
   private applyCursorParams(entry: LoadedEntry, modelSettings?: ModelSettings): void {
