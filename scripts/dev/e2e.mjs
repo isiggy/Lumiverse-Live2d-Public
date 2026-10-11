@@ -572,6 +572,10 @@ async function runGroup() {
   // Dragging the first member's model moves only it.
   const first = before.live2d.columns[0].box;
   const second = before[owners[1]].columns[1].box;
+  if (!first || !second) {
+    console.log('Skipping the remaining checks: member 1 or 2 has no model on screen to drag.');
+    return;
+  }
   const grabX = center(first);
   const grabY = first.y + first.height * 0.4;
   await page.mouse.move(grabX, grabY);

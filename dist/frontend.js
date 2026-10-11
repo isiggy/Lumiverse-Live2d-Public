@@ -397,6 +397,27 @@ var extra_min_default = 'var __pow=Math.pow;!function(t,e){"object"==typeof expo
 
 // src/frontend/runtime.ts
 var runtimePromise = null;
+var DISPLAY_PATCHES = [
+  [
+    "setGl(t){this.gl=t}",
+    "setGl(t){this.gl=t;const s=this._setsByGl||(this._setsByGl=new WeakMap);s.has(t)||s.set(t,[]);this._shaderSets=s.get(t)}"
+  ],
+  [
+    "pe.getInstance()._shaderSets=[]",
+    "pe.getInstance()._setsByGl.set(t,pe.getInstance()._shaderSets=[])"
+  ],
+  ["doDrawModel(){this.preDraw(),", "doDrawModel(){pe.getInstance().setGl(this.gl),this.preDraw(),"]
+];
+function patchDisplay(source) {
+  for (const [find, replace] of DISPLAY_PATCHES) {
+    const at = source.indexOf(find);
+    if (at === -1 || source.indexOf(find, at + 1) !== -1) {
+      throw new Error(`pixi-live2d-display patch doesn't fit this build: ${find}`);
+    }
+    source = source.slice(0, at) + replace + source.slice(at + find.length);
+  }
+  return source;
+}
 function injectScript(source, label) {
   return new Promise((resolve, reject) => {
     const blob = new Blob([source], { type: "text/javascript" });
@@ -425,7 +446,7 @@ function ensureLive2DRuntime() {
       await injectScript(live2d_min_default, "cubism2-core");
       if (!window.PIXI)
         await injectScript(pixi_min_default, "pixi");
-      await injectScript(index_min_default, "pixi-live2d-display");
+      await injectScript(patchDisplay(index_min_default), "pixi-live2d-display");
       await injectScript(extra_min_default, "pixi-live2d-display-extra");
       if (!window.PIXI?.live2d?.Live2DModel) {
         throw new Error("Live2D runtime did not initialize (PIXI.live2d missing).");

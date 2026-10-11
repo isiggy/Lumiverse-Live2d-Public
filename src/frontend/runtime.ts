@@ -22,6 +22,41 @@ declare global {
 
 let runtimePromise: Promise<any> | null = null;
 
+/**
+ * pixi-live2d-display's Cubism 4 renderer keeps its shader programs in one
+ * global (the framework's CubismShader_WebGL singleton, `pe` in this build),
+ * compiled for the WebGL context the latest model was set up in. The stage
+ * gives each model its own PIXI application and so its own context, and with
+ * the stock code only the last model set up draws. These edits keep the
+ * programs per context and switch the singleton to the drawing renderer's
+ * context before each model draws.
+ */
+const DISPLAY_PATCHES: Array<[find: string, replace: string]> = [
+  // One set of programs per WebGL context, picked by setGl.
+  [
+    'setGl(t){this.gl=t}',
+    'setGl(t){this.gl=t;const s=this._setsByGl||(this._setsByGl=new WeakMap);s.has(t)||s.set(t,[]);this._shaderSets=s.get(t)}',
+  ],
+  // A model set up in a context recompiles that context's programs, not everyone's.
+  [
+    'pe.getInstance()._shaderSets=[]',
+    'pe.getInstance()._setsByGl.set(t,pe.getInstance()._shaderSets=[])',
+  ],
+  // Draw (and draw masks) with the programs of the renderer's own context.
+  ['doDrawModel(){this.preDraw(),', 'doDrawModel(){pe.getInstance().setGl(this.gl),this.preDraw(),'],
+];
+
+function patchDisplay(source: string): string {
+  for (const [find, replace] of DISPLAY_PATCHES) {
+    const at = source.indexOf(find);
+    if (at === -1 || source.indexOf(find, at + 1) !== -1) {
+      throw new Error(`pixi-live2d-display patch doesn't fit this build: ${find}`);
+    }
+    source = source.slice(0, at) + replace + source.slice(at + find.length);
+  }
+  return source;
+}
+
 function injectScript(source: string, label: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const blob = new Blob([source], { type: 'text/javascript' });
@@ -50,7 +85,7 @@ export function ensureLive2DRuntime(): Promise<any> {
       await injectScript(cubismCoreSrc, 'cubism4-core');
       await injectScript(cubism2Src, 'cubism2-core');
       if (!window.PIXI) await injectScript(pixiSrc, 'pixi');
-      await injectScript(displaySrc, 'pixi-live2d-display');
+      await injectScript(patchDisplay(displaySrc), 'pixi-live2d-display');
       await injectScript(extraSrc, 'pixi-live2d-display-extra');
       if (!window.PIXI?.live2d?.Live2DModel) {
         throw new Error('Live2D runtime did not initialize (PIXI.live2d missing).');
