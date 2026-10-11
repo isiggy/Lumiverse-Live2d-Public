@@ -77,6 +77,8 @@ interface LoadedEntry {
   talking: boolean;
   abortTalk: boolean;
   frames: any[];
+  /** Erases everything drawn outside the model's canvas; null when clipping is off. */
+  clip: any | null;
 }
 
 function dirname(path: string): string {
@@ -323,6 +325,7 @@ export class Stage {
       talking: false,
       abortTalk: false,
       frames: [],
+      clip: null,
     };
     this.loaded = entry;
 
@@ -485,6 +488,41 @@ export class Stage {
     entry.model.rotation = ((settings.rotation || 0) * Math.PI) / 180;
     entry.model.x = width / 2 + ((width / 2) * settings.x) / 100;
     entry.model.y = height / 2 + ((height / 2) * settings.y) / 100;
+    this.applyClip(entry, settings.clip_to_canvas);
+  }
+
+  /**
+   * Full-scene models often carry backdrop art far bigger than their canvas,
+   * which the Cubism editor crops away but a plain render shows, so zooming out
+   * leaves an opaque frame around the model. The Cubism renderer turns off
+   * scissor and stencil tests, so PIXI masks can't clip it; instead a child
+   * drawn after the model erases the stage's pixels everywhere outside the
+   * canvas rectangle, in the model's own (rotated, scaled) coordinates.
+   */
+  private applyClip(entry: LoadedEntry, clip: boolean): void {
+    const PIXI = window.PIXI;
+    if (!clip || !PIXI) {
+      if (entry.clip) {
+        entry.model.removeChild(entry.clip);
+        entry.clip.destroy();
+        entry.clip = null;
+      }
+      return;
+    }
+    if (entry.clip) return;
+    const { width: w, height: h } = modelSize(entry.model);
+    const far = 100 * Math.max(w, h);
+    const eraser = new PIXI.Graphics();
+    eraser.blendMode = PIXI.BLEND_MODES.ERASE;
+    eraser.beginFill(0xffffff, 1);
+    eraser.drawRect(-far, -far, w + 2 * far, far); // above
+    eraser.drawRect(-far, h, w + 2 * far, far); // below
+    eraser.drawRect(-far, 0, far, h); // left
+    eraser.drawRect(w, 0, far, h); // right
+    eraser.endFill();
+    // Children render after the model itself; keep it under any debug frames.
+    entry.model.addChildAt(eraser, 0);
+    entry.clip = eraser;
   }
 
   applyCursorParams(entry: LoadedEntry | null = this.loaded, modelSettings?: ModelSettings): void {
@@ -532,6 +570,12 @@ export class Stage {
     const internal = entry.model?.internalModel;
     if (!PIXI || !internal) return false;
     try {
+      if (entry.clip) {
+        // Parts outside the canvas aren't drawn, so they can't be grabbed either.
+        const onStage = entry.model.toLocal(new PIXI.Point(point.x, point.y));
+        const { width, height } = modelSize(entry.model);
+        if (onStage.x < 0 || onStage.y < 0 || onStage.x > width || onStage.y > height) return false;
+      }
       const local = entry.model.toModelPosition(new PIXI.Point(point.x, point.y));
       const core = internal.coreModel;
       const hasOpacity = typeof core?.getDrawableOpacity === 'function';
