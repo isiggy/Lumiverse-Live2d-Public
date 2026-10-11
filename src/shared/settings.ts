@@ -67,6 +67,11 @@ export interface AnimationMapping {
   motion: string; // 'none' or '<group>_id=<index|random>'
 }
 
+export interface DefaultAnimation extends AnimationMapping {
+  /** Keep the default playing: its motion repeats and its expression comes back once other animations finish. */
+  loop: boolean;
+}
+
 export interface StarterAnimation extends AnimationMapping {
   delay: number; // ms before playing on chat load
 }
@@ -88,7 +93,7 @@ export interface ModelSettings {
   mouth_open_speed: number;
   mouth_time_per_character: number;
   animation_starter: StarterAnimation;
-  animation_default: AnimationMapping;
+  animation_default: DefaultAnimation;
   animation_click: ClickAnimation;
   hit_areas: Record<string, ClickAnimation>;
   classify_mapping: Record<string, AnimationMapping>;
@@ -177,7 +182,7 @@ export function defaultModelSettings(hitAreaNames: string[] = []): ModelSettings
     mouth_open_speed: 1.0,
     mouth_time_per_character: 30,
     animation_starter: { expression: 'none', motion: 'none', delay: 0 },
-    animation_default: { expression: 'none', motion: 'none' },
+    animation_default: { expression: 'none', motion: 'none', loop: false },
     animation_click: { expression: 'none', motion: 'none', message: '' },
     hit_areas: {},
     classify_mapping: {},

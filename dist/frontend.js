@@ -457,7 +457,7 @@ function defaultModelSettings(hitAreaNames = []) {
     mouth_open_speed: 1,
     mouth_time_per_character: 30,
     animation_starter: { expression: "none", motion: "none", delay: 0 },
-    animation_default: { expression: "none", motion: "none" },
+    animation_default: { expression: "none", motion: "none", loop: false },
     animation_click: { expression: "none", motion: "none", message: "" },
     hit_areas: {},
     classify_mapping: {}
@@ -531,6 +531,9 @@ function normalizeModelSettings(raw, hitAreaNames = []) {
 
 // src/frontend/stage.ts
 var delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+var MOTION_PRIORITY_IDLE = 1;
+var DEFAULT_LOOP_GROUP = "__live2d_avatars_default__";
+var EXPRESSION_HOLD_MS = 5000;
 var INTERACTIVE_SELECTOR = [
   "input",
   "textarea",
@@ -771,7 +774,11 @@ class Stage {
       talking: false,
       abortTalk: false,
       frames: [],
-      clip: null
+      clip: null,
+      expression: "none",
+      expressionAt: 0,
+      idleGroup: model.internalModel.motionManager?.groups?.idle,
+      loopingMotion: null
     };
     this.loaded = entry;
     this.app.stage.addChild(model);
@@ -1138,12 +1145,48 @@ class Stage {
         }
       } catch {}
     }
+    try {
+      this.loopDefault(entry);
+    } catch {}
+  }
+  loopDefault(entry) {
+    const manager = entry.model.internalModel?.motionManager;
+    if (!manager)
+      return;
+    const mapping = this.deps.getSettings().characterModelsSettings[entry.characterId]?.[entry.modelId]?.animation_default;
+    const loop = mapping?.loop === true;
+    const motion = loop && mapping.motion !== "none" ? mapping.motion : null;
+    if (motion !== entry.loopingMotion) {
+      if (motion) {
+        const [group = motion, id] = motion.split("_id=");
+        const definitions = manager.definitions?.[group] ?? [];
+        manager.definitions[DEFAULT_LOOP_GROUP] = id === undefined || id === "random" ? definitions : definitions.slice(Number(id), Number(id) + 1);
+        manager.motionGroups[DEFAULT_LOOP_GROUP] = [];
+        manager.groups.idle = DEFAULT_LOOP_GROUP;
+      } else {
+        manager.groups.idle = entry.idleGroup;
+      }
+      entry.loopingMotion = motion;
+      if (manager.state.currentPriority <= MOTION_PRIORITY_IDLE)
+        manager.stopAllMotions();
+    }
+    if (!loop || mapping.expression === "none" || entry.expression === mapping.expression)
+      return;
+    const state = manager.state;
+    if (Math.max(state.currentPriority, state.reservePriority) > MOTION_PRIORITY_IDLE)
+      return;
+    if (performance.now() - entry.expressionAt < EXPRESSION_HOLD_MS)
+      return;
+    this.playExpression(mapping.expression);
   }
   async playExpression(expression) {
     if (!this.loaded || expression === "none")
       return;
+    const entry = this.loaded;
     try {
-      await this.loaded.model.expression(expression);
+      await entry.model.expression(expression);
+      entry.expression = expression;
+      entry.expressionAt = performance.now();
     } catch (error) {
       this.deps.log(`Expression "${expression}" failed: ${String(error)}`);
     }
@@ -1677,7 +1720,13 @@ class SettingsUI {
     host.appendChild(section("Cursor tracking parameters", cursor));
     const animations = el("div");
     animations.appendChild(this.animationRow("Starter", description, modelSettings.animation_starter, true));
-    animations.appendChild(this.animationRow("Default", description, modelSettings.animation_default, false));
+    const defaultRow = this.animationRow("Default", description, modelSettings.animation_default, false);
+    defaultRow.appendChild(checkbox("Loop the default animation", modelSettings.animation_default.loop, (value) => {
+      modelSettings.animation_default.loop = value;
+      controller.saveDebounced();
+    }));
+    defaultRow.appendChild(note("When looping, the default motion replaces the model’s idle motion and the default expression stays on. " + "Starter, click and emotion animations play once, then the default comes back."));
+    animations.appendChild(defaultRow);
     const clickRow = this.animationRow("On click", description, modelSettings.animation_click, false);
     const clickMessage = el("input", "l2d-input");
     clickMessage.type = "text";

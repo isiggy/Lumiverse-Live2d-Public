@@ -590,7 +590,20 @@ export class SettingsUI {
     // Animations: starter / default / click
     const animations = el('div');
     animations.appendChild(this.animationRow('Starter', description, modelSettings.animation_starter, true));
-    animations.appendChild(this.animationRow('Default', description, modelSettings.animation_default, false));
+    const defaultRow = this.animationRow('Default', description, modelSettings.animation_default, false);
+    defaultRow.appendChild(
+      checkbox('Loop the default animation', modelSettings.animation_default.loop, (value) => {
+        modelSettings.animation_default.loop = value;
+        controller.saveDebounced();
+      }),
+    );
+    defaultRow.appendChild(
+      note(
+        'When looping, the default motion replaces the model’s idle motion and the default expression stays on. ' +
+          'Starter, click and emotion animations play once, then the default comes back.',
+      ),
+    );
+    animations.appendChild(defaultRow);
 
     const clickRow = this.animationRow('On click', description, modelSettings.animation_click, false);
     const clickMessage = el('input', 'l2d-input') as HTMLInputElement;
