@@ -7,8 +7,9 @@ A Spindle extension for Lumiverse that shows Live2D models as character avatars 
 - `spindle.json`: extension manifest.
 - `src/backend.ts`: runs in a Lumiverse-managed Bun process. Settings and model storage, ZIP import, streaming model files to the browser, LLM emotion classification.
 - `src/frontend.ts`: browser entry. Wires the stage, settings tab and backend messages together.
-- `src/frontend/stage.ts`: PIXI + pixi-live2d-display rendering and model interaction. `ui.ts` is the settings tab, `assets.ts` the model file cache, `runtime.ts` loads the vendored libraries, `tus.ts` the upload client.
-- `src/shared/`: the settings schema and the frontend/backend message types.
+- `src/frontend/stage.ts`: PIXI + pixi-live2d-display rendering and model interaction. `ui.ts` is the settings tab, `assets.ts` the model file cache, `runtime.ts` loads the vendored libraries, `tus.ts` the upload client, `thumbnail.ts` turns a stage capture into a library thumbnail.
+- `src/shared/`: the settings schema, the frontend/backend message types, and `settings-file.ts`, the export/import file format (shared with the Spine extension; keep the two copies in step).
+- The Character model dropdowns are Lumiverse's own searchable select (`ctx.components.mountSelect`), mounted after each render into placeholders and destroyed on the next; e2e drives them by clicking the trigger and the `[role="option"]` rows.
 - `vendor/`: Live2D and PIXI runtime builds, embedded into `dist/frontend.js` at build time.
 - `dist/` is committed, because Lumiverse installs straight from the repo. Rebuild before committing source changes.
 
@@ -35,6 +36,7 @@ scripts/dev/lumiverse.sh e2e      # headless: create a Haru chat, import and bin
 `e2e` prints `OK: avatar overlay is on screen` and writes screenshots to `$LUMI_WORK/shots/`. After changing code, run `deploy` then `e2e` again.
 
 - `e2e --model path/to/model.zip` tests a specific model instead of Haru. The extension names an imported model after its zip file, so `e2e` finds it by that name and imports it only if it isn't in the library yet.
+- `e2e --library` then tests the model library (thumbnail, sorting, filter, tiles and list, persistence), search in the model dropdown, and settings file export and import. It imports six copies of the model zip under other names, so the dropdown has enough options to show its search field.
 - `e2e --slow` sends the browser's traffic through a 3 MB/s proxy (`scripts/dev/throttle-proxy.mjs`), like a remote user. Use it for anything that touches model downloads: over loopback the browser keeps up with any amount of data, so transfer bugs don't show.
 
 Other commands: `stop`, `restart`, `status`, `logs [n]`, `seed` (character and chat only), `models` (Haru and Shizuku test ZIPs in `$LUMI_WORK/models/`). `export` the variable rather than prefixing one command, since every command reads it.

@@ -6,8 +6,9 @@ Supports **Cubism 2.1** (`*.model.json`) and **Cubism 3/4/5** (`*.model3.json`) 
 
 ## Features
 
-- **Model library** — import Live2D model folders as `.zip` archives straight from the browser. Files are stored in the extension's private storage and cached client-side (Cache Storage) for instant reloads.
-- **Per-character bindings** — assign a model to each character; the avatar loads automatically when you open that character's chat.
+- **Model library** — import Live2D model folders as `.zip` archives straight from the browser. Files are stored in the extension's private storage and cached client-side (Cache Storage) for instant reloads. Shown as tiles with a thumbnail of each model (taken the first time it's shown; *Update thumbnail* under *Model settings* retakes it) or as a list, filtered by name and sorted by name, import date or size.
+- **Per-character bindings** — assign a model to each character; the avatar loads automatically when you open that character's chat. The character and model dropdowns have a search field once the list gets long.
+- **Settings files** — *Export settings* saves a character's model and animation settings for its model to a `.json` file; *Import settings* loads one onto the selected character, binding it to the file's model (found by id, then name). The file format is shared with the Spine Avatars extension, which refuses Live2D files and vice versa.
 - **Emotion-driven animation** — new character messages are classified into one of the classic 28 emotions (`joy`, `anger`, `surprise`, …) with a quiet LLM generation, and each emotion can be mapped to a model expression and/or motion. Alternatively reuse Lumiverse's own expression detection (`EXPRESSION_CHANGED`) or turn it off.
 - **Talking mouth animation** — the mouth-open parameter is animated while the character "speaks", scaled by message length (configurable speed and per-character duration; parameter auto-detected with the same fallbacks as the ST extension).
 - **Hit areas & interactions** — click the model to trigger mapped expressions/motions per hit area (priority-ordered like the ST extension), optionally sending a message into the chat and auto-triggering a reply ("Auto-send interaction").
