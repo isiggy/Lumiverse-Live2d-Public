@@ -46,7 +46,7 @@ Other commands: `stop`, `restart`, `status`, `logs [n]`, `seed` (character and c
 
 - **Old Bun.** The preinstalled Bun is 1.3.x and Lumiverse refuses to start below 1.4. `bun.sh` is blocked by the network proxy, so the script downloads Bun from GitHub releases.
 - **Extension backend crashes with `TypeError: Unable to deserialize data`.** Lumiverse runs extension backends with `bun` from PATH (the old one), and the IPC handshake between Bun versions fails. The script sets `LUMIVERSE_BUN_METHOD=direct` and `LUMIVERSE_BUN_PATH` so they use the same Bun as the server.
-- **`EAFNOSUPPORT` on listen.** Lumiverse binds `::` and the container has no IPv6. The script patches `src/main.ts` to bind `0.0.0.0`.
+- **`EAFNOSUPPORT` on listen.** Lumiverse binds `::` and the container has no IPv6. The script sets `LUMIVERSE_HOST=0.0.0.0`, which newer Lumiverse reads, and patches `src/main.ts` to bind `0.0.0.0` on versions that hard-code `::`.
 - **Server exits asking for the setup wizard.** It needs `OWNER_PASSWORD` (and `OWNER_USERNAME`) on first boot to create the owner account.
 - **No web app build needed.** Lumiverse commits a prebuilt `frontend/dist`; the server just needs `FRONTEND_DIR` pointing at it.
 - **Stopping the server.** Use `lumiverse.sh stop`, which kills the saved PID. `pkill -f "src/index.ts"` also matches the Bash tool's own shell command and kills it (exit code 144).
