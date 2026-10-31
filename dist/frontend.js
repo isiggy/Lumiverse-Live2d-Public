@@ -2544,7 +2544,7 @@ html.live2d-avatars-hover, html.live2d-avatars-hover * { cursor: grab !important
    but under <main> (z-index 1), which holds the chat. While a chat is open the
    overlay moves into the chat view instead (see placeOverlay). */
 html.live2d-avatars-bg .live2d-avatars-mount { z-index: 0 !important; }
-html.live2d-avatars-bg .live2d-avatars-overlay { z-index: 0; }
+html.live2d-avatars-bg .live2d-avatars-overlay { z-index: 1; }
 `;
 var TAB_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4.2"/><path d="M9.5 7.5h.01M14.5 7.5h.01"/><path d="M10 10c.6.6 1.3.9 2 .9s1.4-.3 2-.9"/><path d="M4.5 21c.8-3.6 3.9-6 7.5-6s6.7 2.4 7.5 6"/></svg>';
 function downloadJson(fileName, value) {
