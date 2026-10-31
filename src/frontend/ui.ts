@@ -542,7 +542,8 @@ export class SettingsUI {
           note(
             'Group chat: every member with a model is shown. The stage is split into equal columns, one per ' +
               'member with a model (Live2D or, with the Spine Avatars extension, Spine), in member order. ' +
-              'Scale 1 fits the model in its column; X and Y offset and Fit to canvas work within that column.',
+              'Scale 1 fits the model in its column; X and Y offset and Fit to canvas work within that column. ' +
+              'Where models overlap, Send to front and Send to back in Model settings choose which one is drawn on top.',
           ),
         );
       }
@@ -832,6 +833,20 @@ export class SettingsUI {
         fitHint,
       ),
     );
+    if (controller.stage.getChatContext().characterIds.length > 1 && this.isOnStage(characterId)) {
+      // Where models overlap in a group chat, Live2D or Spine.
+      const stackHint = el('span', 'l2d-dim', '');
+      const restack = (toFront: boolean) => {
+        if (controller.stage.restack(characterId, toFront)) stackHint.textContent = '';
+        else if (!controller.stage.isOnStage(characterId, modelId)) stackHint.textContent = 'Show the model first, then try again.';
+        else stackHint.textContent = toFront ? 'Already in front.' : 'Already at the back.';
+      };
+      const front = button('Send to front', () => restack(true));
+      front.title = 'Draw this model over the other models in the chat where they overlap';
+      const back = button('Send to back', () => restack(false));
+      back.title = 'Draw this model under the other models in the chat where they overlap';
+      host.appendChild(row(front, back, stackHint));
+    }
     host.appendChild(scaleSlider);
     host.appendChild(xSlider);
     host.appendChild(ySlider);

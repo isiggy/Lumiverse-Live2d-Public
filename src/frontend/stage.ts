@@ -7,6 +7,8 @@
  * Every character in the chat that has a model gets one: one in a solo chat,
  * one per member in a group chat, each on its own canvas stacked over the
  * stage (clipping a model erases pixels, which must not reach the others).
+ * Over the app the canvases go in a layer shared with the Spine extension and
+ * are stacked in one order with its models (Send to front / Send to back).
  * The stage is split into equal columns, one per member with a model, left to
  * right in member order, and each model is laid out inside its column: X/Y
  * offsets are a percent of half the column, and Fit to canvas fits the column.
@@ -16,7 +18,16 @@
  */
 
 import type { ModelAssets, ModelBundle } from './assets';
-import { type Columns, SharedColumns, sameColumns } from './columns';
+import {
+  type Columns,
+  type LayerKind,
+  type Stacked,
+  SharedColumns,
+  avatarLayer,
+  releaseAvatarLayers,
+  sameColumns,
+  sameStack,
+} from './columns';
 import { ensureLive2DRuntime } from './runtime';
 import { squareThumbnail, THUMBNAIL_RENDER_PIXELS } from './thumbnail';
 import {
@@ -40,6 +51,8 @@ const DEFAULT_LOOP_GROUP = '__live2d_avatars_default__';
 const EXPRESSION_HOLD_MS = 5000;
 /** How long a model has been on stage before its first thumbnail is taken (its textures and idle pose have settled). */
 const THUMBNAIL_DELAY_MS = 1500;
+/** This extension's id in the registry shared with the Spine extension (columns.ts). */
+const EXTENSION_ID = 'live2d_avatars';
 
 /** Host UI under the pointer that must keep its clicks even where the model is drawn. */
 const INTERACTIVE_SELECTOR = [
@@ -86,8 +99,12 @@ export interface StageDeps {
   /** The stage changed a model's position itself (a drag). */
   layoutChanged(): void;
   assets: ModelAssets;
-  /** Whether the stage draws over the app (rather than in the settings tab), where other avatar extensions draw too. */
-  drawsOverApp(): boolean;
+  /**
+   * Where the stage draws over the app, in a layer shared with other avatar
+   * extensions: in front of the app or as the chat background. Null when it
+   * draws in the settings tab instead.
+   */
+  layer(): LayerKind | null;
   /** Send a hit-area interaction message into the chat, from a click on this character's model. */
   sendInteraction(message: string, characterId: string): void;
   /** Store a model's library thumbnail (an image data URL). */
@@ -102,6 +119,8 @@ interface LoadedEntry {
   /** The model's own PIXI application and canvas, the size of the stage. */
   app: any;
   canvas: HTMLCanvasElement;
+  /** Place in the stacking order of every model on stage, counted from the bottom. */
+  rank: number;
   objectUrls: string[];
   lastMotion: string | null;
   talking: boolean;
@@ -215,6 +234,8 @@ export class Stage {
   /** Characters in the chat, in member order. */
   private characterIds: string[] = [];
   private columns: Columns = { count: 1, index: new Map() };
+  /** Every model in the chat's columns (this extension's and the Spine extension's), bottom to top. */
+  private stack: Stacked[] = [];
   private readonly sharedColumns: SharedColumns;
   private loadToken = 0;
   private ticker: number | null = null;
@@ -241,7 +262,11 @@ export class Stage {
 
   constructor(private deps: StageDeps) {
     for (const [target, type, listener, options] of this.listeners) target.addEventListener(type, listener, options);
-    this.sharedColumns = new SharedColumns('live2d_avatars', () => this.updateColumns());
+    this.sharedColumns = new SharedColumns(EXTENSION_ID, () => this.updateColumns());
+    this.sharedColumns.setHitTest((canvas, clientX, clientY) => {
+      const entry = this.loaded.find((candidate) => candidate.canvas === canvas);
+      return entry && this.isOverModel(entry, this.toStagePoint({ clientX, clientY })) ? entry.characterId : null;
+    });
   }
 
   destroy(): void {
@@ -308,18 +333,50 @@ export class Stage {
   }
 
   /**
-   * Share which characters have a model here with the other avatar extension,
-   * and lay the models out again if the columns changed.
+   * Share which characters have a model here, and their stacking layers, with
+   * the other avatar extension; lay the models out again if the columns
+   * changed, and restack them if the stacking order did.
    */
   private updateColumns(): void {
-    const own = [...this.boundCharacters(this.deps.getSettings()).keys()];
-    const overApp = this.host !== null && this.deps.drawsOverApp();
-    this.sharedColumns.publish(overApp ? own : []);
+    const settings = this.deps.getSettings();
+    const own = [...this.boundCharacters(settings).keys()];
+    const overApp = this.host !== null && this.deps.layer() !== null;
+    this.sharedColumns.publish(overApp ? own : [], settings.characterLayers);
     const columns = this.sharedColumns.layout(this.characterIds, own, overApp);
-    if (sameColumns(columns, this.columns)) return;
+    const stack = this.sharedColumns.stack(columns, own, settings.characterLayers, overApp);
+    const columnsChanged = !sameColumns(columns, this.columns);
+    if (!columnsChanged && sameStack(stack, this.stack)) return;
     this.columns = columns;
+    this.stack = stack;
     this.sortEntries();
-    for (const entry of this.loaded) this.applyLayout(entry);
+    if (columnsChanged) for (const entry of this.loaded) this.applyLayout(entry);
+  }
+
+  /**
+   * Draw a character's model above (or below) every other model in the chat,
+   * from either extension. False when it isn't on stage with other models, or
+   * is already there.
+   */
+  restack(characterId: string, toFront: boolean): boolean {
+    this.updateColumns();
+    const self = this.stack.find((item) => item.extension === EXTENSION_ID && item.characterId === characterId);
+    if (!self || this.stack.length < 2) return false;
+    if (this.stack[toFront ? this.stack.length - 1 : 0] === self) return false;
+    const others = this.stack.filter((item) => item !== self).map((item) => item.layer);
+    const layer = toFront ? Math.max(...others) + 1 : Math.min(...others) - 1;
+    const settings = this.deps.getSettings();
+    if (layer === 0) delete settings.characterLayers[characterId];
+    else settings.characterLayers[characterId] = layer;
+    this.deps.saveSettingsDebounced();
+    this.updateColumns();
+    return true;
+  }
+
+  /** Where the stage draws moved (in front of the app or behind the chat): move the canvases there. */
+  layerChanged(): void {
+    this.updateColumns();
+    this.sortEntries();
+    releaseAvatarLayers();
   }
 
   /** Rebuild the whole stage from current settings + chat context. */
@@ -374,6 +431,7 @@ export class Stage {
   private createApp(PIXI: any, host: HTMLElement): { app: any; canvas: HTMLCanvasElement } {
     const canvas = document.createElement('canvas');
     canvas.className = 'live2d-avatars-canvas';
+    this.sharedColumns.adopt(canvas);
     host.appendChild(canvas);
     const hostRect = host.getBoundingClientRect();
     if (hostRect.width === 0 || hostRect.height === 0) {
@@ -442,6 +500,7 @@ export class Stage {
       model,
       app,
       canvas,
+      rank: 0,
       objectUrls,
       lastMotion: null,
       talking: false,
@@ -485,15 +544,24 @@ export class Stage {
     }
   }
 
-  /** Keep the models in column order, for stacking and for hit-testing (rightmost on top). */
+  /**
+   * Keep the models in column order, and their canvases in stacking order: in
+   * the shared layer over the app, or in the host in the settings tab.
+   */
   private sortEntries(): void {
     const column = (entry: LoadedEntry) => this.columns.index.get(entry.characterId) ?? 0;
     this.loaded.sort((a, b) => column(a) - column(b));
-    const host = this.host;
-    if (!host) return;
     for (const entry of this.loaded) {
-      if (entry.canvas.parentElement === host) host.appendChild(entry.canvas);
+      const rank = this.stack.findIndex((item) => item.extension === EXTENSION_ID && item.characterId === entry.characterId);
+      entry.rank = rank === -1 ? this.stack.length + column(entry) : rank;
     }
+    const host = this.host;
+    if (!host || this.loaded.length === 0) return;
+    const kind = this.deps.layer();
+    this.sharedColumns.place(
+      kind ? avatarLayer(kind) : host,
+      this.loaded.map((entry) => ({ canvas: entry.canvas, rank: entry.rank })),
+    );
   }
 
   /**
@@ -789,19 +857,9 @@ export class Stage {
     if (this.loaded.length === 0) return null;
     const target = event.target instanceof Element ? event.target : null;
     if (target?.closest(INTERACTIVE_SELECTOR)) return null;
-
-    const canvases = this.loaded.map((entry) => entry.canvas);
-    for (const canvas of canvases) canvas.style.pointerEvents = 'auto';
-    const topmost = document.elementFromPoint(event.clientX, event.clientY);
-    for (const canvas of canvases) canvas.style.pointerEvents = '';
-    if (!(topmost instanceof HTMLCanvasElement) || !canvases.includes(topmost)) return null;
-
-    const point = this.toStagePoint(event);
-    for (let i = this.loaded.length - 1; i >= 0; i--) {
-      const entry = this.loaded[i]!;
-      if (this.isOverModel(entry, point)) return entry;
-    }
-    return null;
+    // Over the app, a Spine model may be drawn over ours: the topmost model wins.
+    const hit = this.sharedColumns.topmostAt(event.clientX, event.clientY);
+    return hit?.extension === EXTENSION_ID ? (this.entryFor(hit.characterId) ?? null) : null;
   }
 
   private isOverModel(entry: LoadedEntry, point: { x: number; y: number }): boolean {
@@ -936,7 +994,7 @@ export class Stage {
     document.documentElement.classList.toggle('live2d-avatars-hover', hovering);
   }
 
-  private toStagePoint(event: PointerEvent): { x: number; y: number } {
+  private toStagePoint(event: { clientX: number; clientY: number }): { x: number; y: number } {
     const rect = this.host?.getBoundingClientRect();
     return { x: event.clientX - (rect?.left ?? 0), y: event.clientY - (rect?.top ?? 0) };
   }
@@ -1170,5 +1228,6 @@ export class Stage {
       }
       entry.canvas.remove();
     }
+    releaseAvatarLayers();
   }
 }

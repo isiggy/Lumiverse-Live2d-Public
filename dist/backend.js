@@ -468,7 +468,8 @@ function defaultSettings() {
   return {
     global: defaultGlobalSettings(),
     characterModelMapping: {},
-    characterModelsSettings: {}
+    characterModelsSettings: {},
+    characterLayers: {}
   };
 }
 function normalizeSettings(raw) {
@@ -484,6 +485,12 @@ function normalizeSettings(raw) {
   }
   if (value.characterModelsSettings && typeof value.characterModelsSettings === "object") {
     base.characterModelsSettings = { ...value.characterModelsSettings };
+  }
+  if (value.characterLayers && typeof value.characterLayers === "object") {
+    for (const [characterId, layer] of Object.entries(value.characterLayers)) {
+      if (typeof layer === "number" && Number.isFinite(layer) && layer !== 0)
+        base.characterLayers[characterId] = layer;
+    }
   }
   return base;
 }

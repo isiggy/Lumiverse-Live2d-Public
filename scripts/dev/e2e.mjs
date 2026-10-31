@@ -16,7 +16,9 @@
 //                                 # in its own column, a drag moves only one model, and removing a
 //                                 # member re-lays the stage out. With --spine-model, every other
 //                                 # member gets a Spine model (Spine Avatars must be deployed too)
-//                                 # and both extensions share the columns
+//                                 # and both extensions share the columns and the stacking order
+//                                 # (Send to front / Send to back, which model gets the pointer)
+//   lumiverse.sh e2e --group --stack --spine-model …  # only the stacking checks of a mixed group
 //   (--model and --slow are handled by lumiverse.sh)
 
 import { createRequire } from 'node:module';
@@ -30,6 +32,7 @@ const OUT = process.env.LUMI_OUT;
 const keepOpen = process.argv.includes('--keep-open');
 const testLibrary = process.argv.includes('--library');
 const group = process.argv.includes('--group');
+const stackOnly = process.argv.includes('--stack');
 const lines = (value) => (value || '').split('\n').filter(Boolean);
 const MODEL_ZIPS = lines(process.env.LUMI_MODEL_ZIPS || process.env.LUMI_MODEL_ZIP);
 const SPINE_ZIPS = lines(process.env.LUMI_SPINE_ZIPS);
@@ -496,6 +499,203 @@ async function checkColumns(owners, what) {
   return infos;
 }
 
+/**
+ * The avatar canvases in DOM order (later ones draw on top) with the extension
+ * that draws each, which shared layer it's in, and per column the share of its
+ * pixels drawn. With `alpha`, also each canvas's alpha at a quarter scale.
+ */
+async function canvasStack(columns, alpha = false) {
+  return page.evaluate(
+    ({ columns, alpha }) =>
+      new Promise((resolve) => {
+        requestAnimationFrame(() => {
+          const canvases = [...document.querySelectorAll('[data-lumiverse-avatar]')];
+          const scale = 0.25;
+          resolve(
+            canvases.map((canvas) => {
+              const rect = canvas.getBoundingClientRect();
+              const probe = document.createElement('canvas');
+              probe.width = Math.max(1, Math.round(rect.width * scale));
+              probe.height = Math.max(1, Math.round(rect.height * scale));
+              const context = probe.getContext('2d', { willReadFrequently: true });
+              context.drawImage(canvas, 0, 0, probe.width, probe.height);
+              const data = context.getImageData(0, 0, probe.width, probe.height).data;
+              const columnWidth = probe.width / columns;
+              const drawn = [];
+              for (let column = 0; column < columns; column++) {
+                const x0 = Math.round(column * columnWidth);
+                const x1 = Math.round((column + 1) * columnWidth);
+                let count = 0;
+                for (let y = 0; y < probe.height; y++) {
+                  for (let x = x0; x < x1; x++) if (data[(y * probe.width + x) * 4 + 3] > 16) count++;
+                }
+                drawn.push(+(count / ((x1 - x0) * probe.height)).toFixed(3));
+              }
+              const mask = alpha ? [...Array(probe.width * probe.height).keys()].map((i) => data[i * 4 + 3] > 16) : null;
+              return {
+                owner: canvas.getAttribute('data-lumiverse-avatar'),
+                layer: canvas.parentElement?.getAttribute('data-lumiverse-avatar-layer') ?? null,
+                drawn,
+                mask,
+                width: probe.width,
+                height: probe.height,
+                left: rect.left,
+                top: rect.top,
+              };
+            }),
+          );
+        });
+      }),
+    { columns, alpha },
+  );
+}
+
+/** Which extension shows the grab cursor with the pointer at (x, y): the one whose model it would grab. */
+async function grabbedAt(x, y) {
+  await page.mouse.move(x - 5, y);
+  await page.mouse.move(x, y, { steps: 2 });
+  await page.waitForTimeout(400);
+  return page.evaluate(() =>
+    ['live2d', 'spine'].filter((name) => document.documentElement.classList.contains(`${name}-avatars-hover`)),
+  );
+}
+
+/**
+ * Stacking in a mixed group (members take Live2D and Spine models in turn):
+ * every canvas in the one shared layer, Send to front / Send to back reorder
+ * the canvases across both extensions and decide which model gets the pointer
+ * where two overlap, the Spine canvas splits when a Live2D model sits between
+ * two Spine models, and the order survives a reload.
+ */
+async function checkStacking(members, owners) {
+  const live2d = EXTENSIONS.live2d;
+  const spine = EXTENSIONS.spine;
+  const count = members.length;
+  const describe = (stack) => stack.map((canvas) => `${canvas.owner === 'live2d_avatars' ? 'L' : 'S'}[${canvas.drawn.map((d) => (d > 0.01 ? 1 : 0)).join('')}]`).join(' ');
+  // The canvas drawing member `index`'s model: the one of its extension with pixels in its column.
+  const canvasOf = (stack, index) =>
+    stack.findIndex(
+      (canvas) => canvas.owner === `${owners[index]}_avatars` && canvas.drawn[index] > 0.01,
+    );
+
+  const initial = await canvasStack(count);
+  check(
+    initial.length > 0 && initial.every((canvas) => canvas.layer === 'front'),
+    `every avatar canvas is in the shared front layer (${initial.map((canvas) => canvas.layer).join(', ')})`,
+  );
+
+  // Drag member 2's Spine model half a column left, over member 1's Live2D model.
+  const spineIndex = owners.indexOf('spine');
+  const live2dIndex = owners.indexOf('live2d');
+  const width = 1440 / count;
+  const info = await columnInfo(spine, count);
+  const box = info.columns[spineIndex].box;
+  const grabX = center(box);
+  const grabY = box.y + box.height * 0.5;
+  await page.mouse.move(grabX, grabY);
+  await page.mouse.down();
+  for (let step = 1; step <= 10; step++) await page.mouse.move(grabX - (width * 0.6 * step) / 10, grabY);
+  await page.mouse.up();
+  await page.waitForTimeout(800);
+
+  // A point where both models are drawn.
+  const masks = await canvasStack(count, true);
+  const live2dCanvas = masks[canvasOf(masks, live2dIndex)];
+  const spineCanvas = masks.find((canvas) => canvas.owner === 'spine_avatars' && canvas.drawn[live2dIndex] > 0.001);
+  let point = null;
+  if (live2dCanvas && spineCanvas) {
+    let sumX = 0;
+    let sumY = 0;
+    let n = 0;
+    const both = [];
+    for (let y = 0; y < live2dCanvas.height; y++) {
+      for (let x = 0; x < live2dCanvas.width; x++) {
+        const i = y * live2dCanvas.width + x;
+        if (live2dCanvas.mask[i] && spineCanvas.mask[i]) {
+          both.push([x, y]);
+          sumX += x;
+          sumY += y;
+          n++;
+        }
+      }
+    }
+    if (n > 0) {
+      // The overlapping pixel nearest the overlap's middle, in CSS pixels.
+      const [x, y] = both.reduce((best, p) =>
+        Math.hypot(p[0] - sumX / n, p[1] - sumY / n) < Math.hypot(best[0] - sumX / n, best[1] - sumY / n) ? p : best,
+      );
+      point = { x: x / 0.25 + 2, y: y / 0.25 + 2, pixels: n };
+    }
+  }
+  check(point !== null, `member ${spineIndex + 1}'s Spine model overlaps member ${live2dIndex + 1}'s Live2D model after a drag (${point?.pixels ?? 0} px at quarter scale)`);
+  await page.screenshot({ path: `${OUT}/stack-overlap.png` });
+  if (!point) return;
+
+  const restack = async (ext, index, label) => {
+    await openTab(ext);
+    await selectCharacterIn(ext, members[index]);
+    await clickIn(ext, label);
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(1000);
+  };
+
+  // Live2D member to the front: its canvas goes last and it gets the pointer.
+  await restack(live2d, live2dIndex, 'Send to front');
+  let stack = await canvasStack(count);
+  console.log(`stack after Live2D member ${live2dIndex + 1} to front: ${describe(stack)}`);
+  check(canvasOf(stack, live2dIndex) === stack.length - 1, `Send to front puts member ${live2dIndex + 1}'s Live2D canvas on top`);
+  let grabbed = await grabbedAt(point.x, point.y);
+  check(grabbed.join() === 'live2d', `where they overlap, the pointer goes to the Live2D model in front (${grabbed.join() || 'none'})`);
+  await page.screenshot({ path: `${OUT}/stack-live2d-front.png` });
+
+  // Spine member to the front: back to Spine on top.
+  await restack(spine, spineIndex, 'Send to front');
+  stack = await canvasStack(count);
+  console.log(`stack after Spine member ${spineIndex + 1} to front: ${describe(stack)}`);
+  check(stack[stack.length - 1].owner === 'spine_avatars' && stack[stack.length - 1].drawn[spineIndex] > 0.001, `Send to front puts member ${spineIndex + 1}'s Spine model on top`);
+  grabbed = await grabbedAt(point.x, point.y);
+  check(grabbed.join() === 'spine', `where they overlap, the pointer goes to the Spine model in front (${grabbed.join() || 'none'})`);
+  await page.screenshot({ path: `${OUT}/stack-spine-front.png` });
+
+  // Another Spine member to the back: a Live2D model now sits between the two
+  // Spine models, so the Spine extension draws them on two canvases.
+  const lastSpine = owners.lastIndexOf('spine');
+  if (lastSpine !== spineIndex) {
+    await restack(spine, lastSpine, 'Send to back');
+    stack = await canvasStack(count);
+    console.log(`stack after Spine member ${lastSpine + 1} to back: ${describe(stack)}`);
+    const spineCanvases = stack.filter((canvas) => canvas.owner === 'spine_avatars');
+    check(
+      spineCanvases.length === 2 && stack[0].owner === 'spine_avatars' && stack[0].drawn[lastSpine] > 0.01 && stack[0].drawn[spineIndex] < 0.001,
+      `Send to back puts member ${lastSpine + 1}'s Spine model on its own canvas at the bottom (${describe(stack)})`,
+    );
+    check(
+      stack[stack.length - 1].owner === 'spine_avatars' && stack[stack.length - 1].drawn[lastSpine] < 0.001,
+      `member ${spineIndex + 1}'s Spine model stays on top, without member ${lastSpine + 1}'s`,
+    );
+    await page.screenshot({ path: `${OUT}/stack-spine-split.png` });
+  }
+
+  // The order is saved: after a reload the canvases come back the same way.
+  const saved = describe(stack);
+  await page.reload();
+  await page.waitForTimeout(3000);
+  await waitForModels(owners);
+  await page.waitForTimeout(3000);
+  stack = await canvasStack(count);
+  check(describe(stack) === saved, `the stacking order survives a reload (${describe(stack)})`);
+  grabbed = await grabbedAt(point.x, point.y);
+  check(grabbed.join() === 'spine', `after the reload the pointer still goes to the Spine model in front (${grabbed.join() || 'none'})`);
+  await page.screenshot({ path: `${OUT}/stack-after-reload.png` });
+
+  // Put the dragged model back.
+  await openTab(spine);
+  await selectCharacterIn(spine, members[spineIndex]);
+  await clickIn(spine, 'Fit to canvas');
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(1000);
+}
+
 async function runGroup() {
   console.log('── Group chat ──');
   const members = GROUP_MEMBERS;
@@ -568,6 +768,8 @@ async function runGroup() {
   await page.waitForTimeout(3000);
   await page.screenshot({ path: `${OUT}/group-chat.png` });
   const before = await checkColumns(owners, 'group chat');
+  if (mixed) await checkStacking(members, owners);
+  if (stackOnly) return;
 
   // Dragging the first member's model moves only it.
   const first = before.live2d.columns[0].box;
@@ -713,7 +915,7 @@ try {
     if (!canvas) return null;
     const rect = canvas.getBoundingClientRect();
     return {
-      overlay: !!canvas.closest('.live2d-avatars-overlay'),
+      overlay: !!canvas.closest('[data-lumiverse-avatar-layer]'),
       width: Math.round(rect.width),
       height: Math.round(rect.height),
     };
