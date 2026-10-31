@@ -291,6 +291,9 @@ class ModelAssets {
 // src/frontend/columns.ts
 var REGISTRY_KEY = "__lumiverseAvatarColumns";
 var CHANGED_EVENT = "lumiverse-avatar-columns-changed";
+var OWNER_ATTRIBUTE = "data-lumiverse-avatar";
+var RANK_ATTRIBUTE = "data-lumiverse-avatar-rank";
+var LAYER_ATTRIBUTE = "data-lumiverse-avatar-layer";
 function registry() {
   const scope = window;
   const existing = scope[REGISTRY_KEY];
@@ -301,9 +304,6 @@ function registry() {
   scope[REGISTRY_KEY] = fresh;
   return fresh;
 }
-function sameList(a, b) {
-  return a.length === b.length && a.every((value, index) => value === b[index]);
-}
 function sameColumns(a, b) {
   if (a.count !== b.count || a.index.size !== b.index.size)
     return false;
@@ -312,6 +312,12 @@ function sameColumns(a, b) {
       return false;
   }
   return true;
+}
+function sameStack(a, b) {
+  return a.length === b.length && a.every((item, index) => item.extension === b[index].extension && item.characterId === b[index].characterId && item.layer === b[index].layer);
+}
+function layerValue(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
 class SharedColumns {
@@ -327,12 +333,21 @@ class SharedColumns {
     this.onChange = onChange;
     window.addEventListener(CHANGED_EVENT, this.listener);
   }
-  publish(characterIds) {
+  publish(characterIds, layers = {}) {
     const sorted = [...new Set(characterIds)].sort();
-    if (this.published && sameList(sorted, this.published))
+    const ownLayers = {};
+    for (const characterId of sorted) {
+      const layer = layerValue(layers[characterId]);
+      if (layer !== 0)
+        ownLayers[characterId] = layer;
+    }
+    const key = JSON.stringify([sorted, ownLayers]);
+    if (key === this.published)
       return;
-    this.published = sorted;
-    registry().extensions[this.extensionId] = sorted;
+    this.published = key;
+    const shared = registry();
+    shared.extensions[this.extensionId] = sorted;
+    shared.layers = { ...shared.layers, [this.extensionId]: ownLayers };
     window.dispatchEvent(new CustomEvent(CHANGED_EVENT, { detail: { extension: this.extensionId } }));
   }
   layout(members, own, shared) {
@@ -352,13 +367,135 @@ class SharedColumns {
     }
     return { count: Math.max(1, index.size), index };
   }
+  stack(columns, own, layers, shared) {
+    const items = [];
+    for (const characterId of new Set(own)) {
+      if (columns.index.has(characterId)) {
+        items.push({ extension: this.extensionId, characterId, layer: layerValue(layers[characterId]) });
+      }
+    }
+    if (shared) {
+      const { extensions, layers: sharedLayers } = registry();
+      for (const [extension, characterIds] of Object.entries(extensions)) {
+        if (extension === this.extensionId || !Array.isArray(characterIds))
+          continue;
+        for (const characterId of characterIds) {
+          if (columns.index.has(characterId)) {
+            items.push({ extension, characterId, layer: layerValue(sharedLayers?.[extension]?.[characterId]) });
+          }
+        }
+      }
+    }
+    const column = (item) => columns.index.get(item.characterId) ?? 0;
+    return items.sort((a, b) => a.layer - b.layer || (a.extension < b.extension ? -1 : a.extension > b.extension ? 1 : 0) || column(a) - column(b));
+  }
+  setHitTest(hitTest) {
+    const shared = registry();
+    const hitTests = { ...shared.hitTests };
+    if (hitTest)
+      hitTests[this.extensionId] = hitTest;
+    else
+      delete hitTests[this.extensionId];
+    shared.hitTests = hitTests;
+  }
+  adopt(canvas) {
+    canvas.setAttribute(OWNER_ATTRIBUTE, this.extensionId);
+  }
+  place(parent, canvases) {
+    for (const { canvas, rank } of canvases) {
+      canvas.setAttribute(RANK_ATTRIBUTE, String(rank));
+      if (canvas.parentElement !== parent)
+        parent.appendChild(canvas);
+    }
+    const ranked = [...parent.children].filter((child) => child.hasAttribute(RANK_ATTRIBUTE));
+    const rankOf = (element) => Number(element.getAttribute(RANK_ATTRIBUTE)) || 0;
+    const sorted = [...ranked].sort((a, b) => rankOf(a) - rankOf(b));
+    if (sorted.every((element, index) => element === ranked[index]))
+      return;
+    const end = ranked[ranked.length - 1].nextSibling;
+    for (const element of sorted)
+      parent.insertBefore(element, end);
+  }
+  topmostAt(clientX, clientY) {
+    const canvases = [...document.querySelectorAll(`[${OWNER_ATTRIBUTE}]`)];
+    const previous = canvases.map((canvas) => canvas.style.pointerEvents);
+    for (const canvas of canvases)
+      canvas.style.pointerEvents = "auto";
+    let elements;
+    try {
+      elements = document.elementsFromPoint(clientX, clientY);
+    } finally {
+      canvases.forEach((canvas, index) => canvas.style.pointerEvents = previous[index]);
+    }
+    const hitTests = registry().hitTests ?? {};
+    for (const element of elements) {
+      const extension = element.getAttribute(OWNER_ATTRIBUTE);
+      if (!extension)
+        return null;
+      const characterId = hitTests[extension]?.(element, clientX, clientY) ?? null;
+      if (characterId)
+        return { extension, characterId };
+    }
+    return null;
+  }
   destroy() {
     window.removeEventListener(CHANGED_EVENT, this.listener);
-    const extensions = registry().extensions;
-    if (!(this.extensionId in extensions))
+    this.setHitTest(null);
+    const shared = registry();
+    if (shared.layers)
+      delete shared.layers[this.extensionId];
+    if (!(this.extensionId in shared.extensions))
       return;
-    delete extensions[this.extensionId];
+    delete shared.extensions[this.extensionId];
     window.dispatchEvent(new CustomEvent(CHANGED_EVENT, { detail: { extension: this.extensionId } }));
+  }
+}
+function findLayer(kind) {
+  return document.querySelector(`[${LAYER_ATTRIBUTE}="${kind}"]`);
+}
+function nextAfterOlderHosts(element) {
+  let next = element.nextElementSibling;
+  while (next?.matches(".live2d-avatars-overlay, .spine-avatars-overlay"))
+    next = next.nextElementSibling;
+  return next;
+}
+function placeLayer(layer, kind) {
+  const appRoot = document.querySelector("[data-app-root]") ?? document.body;
+  if (kind === "front") {
+    layer.style.zIndex = "9990";
+    if (layer.parentElement !== appRoot)
+      appRoot.appendChild(layer);
+    return;
+  }
+  const chatBody = document.querySelector('[data-component="ChatView"] > [data-lumiverse-surface="chat-body"]');
+  const target = chatBody?.parentElement ?? appRoot;
+  layer.style.zIndex = chatBody ? "1" : "0";
+  if (layer.parentElement === target && (!chatBody || nextAfterOlderHosts(layer) === chatBody))
+    return;
+  target.insertBefore(layer, chatBody);
+}
+function avatarLayer(kind) {
+  let layer = findLayer(kind);
+  if (!layer) {
+    layer = document.createElement("div");
+    layer.setAttribute(LAYER_ATTRIBUTE, kind);
+    layer.style.cssText = "position: fixed; inset: 0; pointer-events: none;";
+  }
+  placeLayer(layer, kind);
+  return layer;
+}
+function placeAvatarLayers() {
+  for (const kind of ["front", "background"]) {
+    const layer = findLayer(kind);
+    if (layer)
+      placeLayer(layer, kind);
+  }
+}
+function releaseAvatarLayers() {
+  for (const kind of ["front", "background"]) {
+    const layer = findLayer(kind);
+    if (layer && layer.childElementCount === 0)
+      layer.remove();
   }
 }
 
@@ -574,7 +711,8 @@ function defaultSettings() {
   return {
     global: defaultGlobalSettings(),
     characterModelMapping: {},
-    characterModelsSettings: {}
+    characterModelsSettings: {},
+    characterLayers: {}
   };
 }
 function defaultModelSettings(hitAreaNames = []) {
@@ -624,6 +762,12 @@ function normalizeSettings(raw) {
   }
   if (value.characterModelsSettings && typeof value.characterModelsSettings === "object") {
     base.characterModelsSettings = { ...value.characterModelsSettings };
+  }
+  if (value.characterLayers && typeof value.characterLayers === "object") {
+    for (const [characterId, layer] of Object.entries(value.characterLayers)) {
+      if (typeof layer === "number" && Number.isFinite(layer) && layer !== 0)
+        base.characterLayers[characterId] = layer;
+    }
   }
   return base;
 }
@@ -734,6 +878,7 @@ var MOTION_PRIORITY_IDLE = 1;
 var DEFAULT_LOOP_GROUP = "__live2d_avatars_default__";
 var EXPRESSION_HOLD_MS = 5000;
 var THUMBNAIL_DELAY_MS = 1500;
+var EXTENSION_ID = "live2d_avatars";
 var INTERACTIVE_SELECTOR = [
   "input",
   "textarea",
@@ -829,6 +974,7 @@ class Stage {
   chatId = null;
   characterIds = [];
   columns = { count: 1, index: new Map };
+  stack = [];
   sharedColumns;
   loadToken = 0;
   ticker = null;
@@ -852,7 +998,11 @@ class Stage {
     this.deps = deps;
     for (const [target, type, listener, options] of this.listeners)
       target.addEventListener(type, listener, options);
-    this.sharedColumns = new SharedColumns("live2d_avatars", () => this.updateColumns());
+    this.sharedColumns = new SharedColumns(EXTENSION_ID, () => this.updateColumns());
+    this.sharedColumns.setHitTest((canvas, clientX, clientY) => {
+      const entry = this.loaded.find((candidate) => candidate.canvas === canvas);
+      return entry && this.isOverModel(entry, this.toStagePoint({ clientX, clientY })) ? entry.characterId : null;
+    });
   }
   destroy() {
     for (const [target, type, listener, options] of this.listeners) {
@@ -908,16 +1058,44 @@ class Stage {
     return bound;
   }
   updateColumns() {
-    const own = [...this.boundCharacters(this.deps.getSettings()).keys()];
-    const overApp = this.host !== null && this.deps.drawsOverApp();
-    this.sharedColumns.publish(overApp ? own : []);
+    const settings = this.deps.getSettings();
+    const own = [...this.boundCharacters(settings).keys()];
+    const overApp = this.host !== null && this.deps.layer() !== null;
+    this.sharedColumns.publish(overApp ? own : [], settings.characterLayers);
     const columns = this.sharedColumns.layout(this.characterIds, own, overApp);
-    if (sameColumns(columns, this.columns))
+    const stack = this.sharedColumns.stack(columns, own, settings.characterLayers, overApp);
+    const columnsChanged = !sameColumns(columns, this.columns);
+    if (!columnsChanged && sameStack(stack, this.stack))
       return;
     this.columns = columns;
+    this.stack = stack;
     this.sortEntries();
-    for (const entry of this.loaded)
-      this.applyLayout(entry);
+    if (columnsChanged)
+      for (const entry of this.loaded)
+        this.applyLayout(entry);
+  }
+  restack(characterId, toFront) {
+    this.updateColumns();
+    const self = this.stack.find((item) => item.extension === EXTENSION_ID && item.characterId === characterId);
+    if (!self || this.stack.length < 2)
+      return false;
+    if (this.stack[toFront ? this.stack.length - 1 : 0] === self)
+      return false;
+    const others = this.stack.filter((item) => item !== self).map((item) => item.layer);
+    const layer = toFront ? Math.max(...others) + 1 : Math.min(...others) - 1;
+    const settings = this.deps.getSettings();
+    if (layer === 0)
+      delete settings.characterLayers[characterId];
+    else
+      settings.characterLayers[characterId] = layer;
+    this.deps.saveSettingsDebounced();
+    this.updateColumns();
+    return true;
+  }
+  layerChanged() {
+    this.updateColumns();
+    this.sortEntries();
+    releaseAvatarLayers();
   }
   async reload() {
     this.teardownApp();
@@ -966,6 +1144,7 @@ class Stage {
   createApp(PIXI, host) {
     const canvas = document.createElement("canvas");
     canvas.className = "live2d-avatars-canvas";
+    this.sharedColumns.adopt(canvas);
     host.appendChild(canvas);
     const hostRect = host.getBoundingClientRect();
     if (hostRect.width === 0 || hostRect.height === 0) {
@@ -1020,6 +1199,7 @@ class Stage {
       model,
       app,
       canvas,
+      rank: 0,
       objectUrls,
       lastMotion: null,
       talking: false,
@@ -1065,13 +1245,15 @@ class Stage {
   sortEntries() {
     const column = (entry) => this.columns.index.get(entry.characterId) ?? 0;
     this.loaded.sort((a, b) => column(a) - column(b));
-    const host = this.host;
-    if (!host)
-      return;
     for (const entry of this.loaded) {
-      if (entry.canvas.parentElement === host)
-        host.appendChild(entry.canvas);
+      const rank = this.stack.findIndex((item) => item.extension === EXTENSION_ID && item.characterId === entry.characterId);
+      entry.rank = rank === -1 ? this.stack.length + column(entry) : rank;
     }
+    const host = this.host;
+    if (!host || this.loaded.length === 0)
+      return;
+    const kind = this.deps.layer();
+    this.sharedColumns.place(kind ? avatarLayer(kind) : host, this.loaded.map((entry) => ({ canvas: entry.canvas, rank: entry.rank })));
   }
   captureThumbnail(characterId) {
     const entry = this.entryFor(characterId);
@@ -1305,21 +1487,8 @@ class Stage {
     const target = event.target instanceof Element ? event.target : null;
     if (target?.closest(INTERACTIVE_SELECTOR))
       return null;
-    const canvases = this.loaded.map((entry) => entry.canvas);
-    for (const canvas of canvases)
-      canvas.style.pointerEvents = "auto";
-    const topmost = document.elementFromPoint(event.clientX, event.clientY);
-    for (const canvas of canvases)
-      canvas.style.pointerEvents = "";
-    if (!(topmost instanceof HTMLCanvasElement) || !canvases.includes(topmost))
-      return null;
-    const point = this.toStagePoint(event);
-    for (let i = this.loaded.length - 1;i >= 0; i--) {
-      const entry = this.loaded[i];
-      if (this.isOverModel(entry, point))
-        return entry;
-    }
-    return null;
+    const hit = this.sharedColumns.topmostAt(event.clientX, event.clientY);
+    return hit?.extension === EXTENSION_ID ? this.entryFor(hit.characterId) ?? null : null;
   }
   isOverModel(entry, point) {
     const PIXI = window.PIXI;
@@ -1658,6 +1827,7 @@ class Stage {
       } catch {}
       entry.canvas.remove();
     }
+    releaseAvatarLayers();
   }
 }
 
@@ -2023,7 +2193,7 @@ class SettingsUI {
       bindingSection.appendChild(row("Character", characterSelect));
       bindingSection.appendChild(row("Model", modelSelect));
       if (isGroup) {
-        bindingSection.appendChild(note("Group chat: every member with a model is shown. The stage is split into equal columns, one per " + "member with a model (Live2D or, with the Spine Avatars extension, Spine), in member order. " + "Scale 1 fits the model in its column; X and Y offset and Fit to canvas work within that column."));
+        bindingSection.appendChild(note("Group chat: every member with a model is shown. The stage is split into equal columns, one per " + "member with a model (Live2D or, with the Spine Avatars extension, Spine), in member order. " + "Scale 1 fits the model in its column; X and Y offset and Fit to canvas work within that column. " + "Where models overlap, Send to front and Send to back in Model settings choose which one is drawn on top."));
       }
       const characterName = () => characters.find((character) => character.id === this.selectedCharacterId)?.name.replace(/ \(in this chat\)$/, "") ?? "Character";
       const fileStatus = el("span", "l2d-dim", this.fileStatusText);
@@ -2247,6 +2417,22 @@ Used by ${used} character${used === 1 ? "" : "s"}` : ""}`;
     }), button("Update thumbnail", () => {
       fitHint.textContent = controller.updateThumbnail(characterId, modelId) ? "Thumbnail updated." : "Show the model first, then try again.";
     }), fitHint));
+    if (controller.stage.getChatContext().characterIds.length > 1 && this.isOnStage(characterId)) {
+      const stackHint = el("span", "l2d-dim", "");
+      const restack = (toFront) => {
+        if (controller.stage.restack(characterId, toFront))
+          stackHint.textContent = "";
+        else if (!controller.stage.isOnStage(characterId, modelId))
+          stackHint.textContent = "Show the model first, then try again.";
+        else
+          stackHint.textContent = toFront ? "Already in front." : "Already at the back.";
+      };
+      const front = button("Send to front", () => restack(true));
+      front.title = "Draw this model over the other models in the chat where they overlap";
+      const back = button("Send to back", () => restack(false));
+      back.title = "Draw this model under the other models in the chat where they overlap";
+      host.appendChild(row(front, back, stackHint));
+    }
     host.appendChild(scaleSlider);
     host.appendChild(xSlider);
     host.appendChild(ySlider);
@@ -2534,17 +2720,11 @@ function parseSettingsFile(text) {
 }
 
 // src/frontend.ts
-var EXTENSION_ID = "live2d_avatars";
+var EXTENSION_ID2 = "live2d_avatars";
 var STAGE_CSS = `
 .live2d-avatars-overlay { position: fixed; inset: 0; pointer-events: none; z-index: 4; }
 .live2d-avatars-canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; background: transparent; }
 html.live2d-avatars-hover, html.live2d-avatars-hover * { cursor: grab !important; }
-/* Background mode: the host mounts the overlay at z-index 9990 above the whole
-   app. Drop it to 0 so it sits above the app's backdrop and global wallpaper
-   but under <main> (z-index 1), which holds the chat. While a chat is open the
-   overlay moves into the chat view instead (see placeOverlay). */
-html.live2d-avatars-bg .live2d-avatars-mount { z-index: 0 !important; }
-html.live2d-avatars-bg .live2d-avatars-overlay { z-index: 1; }
 `;
 var TAB_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4.2"/><path d="M9.5 7.5h.01M14.5 7.5h.01"/><path d="M10 10c.6.6 1.3.9 2 .9s1.4-.3 2-.9"/><path d="M4.5 21c.8-3.6 3.9-6 7.5-6s6.7 2.4 7.5 6"/></svg>';
 function downloadJson(fileName, value) {
@@ -2601,7 +2781,7 @@ function setup(ctx) {
     saveSettingsDebounced: saveDebounced,
     layoutChanged: () => ui.layoutChanged(),
     assets,
-    drawsOverApp: () => overlayActive,
+    layer: () => overlayActive ? backgroundModeOn() ? "background" : "front" : null,
     sendInteraction: (message, characterId) => {
       const { chatId } = stage.getChatContext();
       if (!chatId)
@@ -2657,26 +2837,11 @@ function setup(ctx) {
     stage.setHost(embeddedHost);
     applyBackgroundMode();
   };
+  const backgroundModeOn = () => settings.global.enabled && settings.global.backgroundMode && overlayActive;
   const applyBackgroundMode = () => {
-    const on = settings.global.enabled && settings.global.backgroundMode && overlayActive;
-    document.documentElement.classList.toggle("live2d-avatars-bg", on);
-    setOverlayTracking(on);
-    placeOverlay();
-  };
-  cleanups.push(() => document.documentElement.classList.remove("live2d-avatars-bg"));
-  const placeOverlay = () => {
-    if (!overlayMount)
-      return;
-    const host = overlayMount.root;
-    const bgOn = document.documentElement.classList.contains("live2d-avatars-bg");
-    const next = host.nextElementSibling;
-    if (bgOn && host.isConnected && next?.getAttribute("data-lumiverse-surface") === "chat-body")
-      return;
-    const chatBody = bgOn ? document.querySelector('[data-component="ChatView"] > [data-lumiverse-surface="chat-body"]') : null;
-    const target = chatBody?.parentElement ?? overlayMount.mountRoot;
-    if (host.parentElement === target && (!chatBody || host.nextElementSibling === chatBody))
-      return;
-    target.insertBefore(host, chatBody ?? null);
+    setOverlayTracking(backgroundModeOn());
+    placeAvatarLayers();
+    stage.layerChanged();
   };
   let overlayObserver = null;
   let placeFrame = null;
@@ -2687,7 +2852,7 @@ function setup(ctx) {
           return;
         placeFrame = window.requestAnimationFrame(() => {
           placeFrame = null;
-          placeOverlay();
+          placeAvatarLayers();
         });
       });
       overlayObserver.observe(document.querySelector("[data-app-root]") ?? document.body, {
@@ -2727,7 +2892,7 @@ function setup(ctx) {
         return;
       status("Uploading…");
       try {
-        const uploadId = await tusUpload(file.bytes, file.name, EXTENSION_ID, (sent, total) => {
+        const uploadId = await tusUpload(file.bytes, file.name, EXTENSION_ID2, (sent, total) => {
           status(`Uploading… ${Math.round(sent / total * 100)}%`);
         });
         status("Importing…");
