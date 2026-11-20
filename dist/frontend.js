@@ -499,6 +499,70 @@ function releaseAvatarLayers() {
   }
 }
 
+// src/frontend/hit-areas.ts
+function hitAreaDefsFromBundle(bundleJson, cubism) {
+  const raw = cubism === 4 ? bundleJson?.HitAreas : bundleJson?.hit_areas;
+  if (!Array.isArray(raw))
+    return [];
+  const defs = [];
+  for (const area of raw) {
+    if (!area || typeof area !== "object")
+      continue;
+    const value = area;
+    const field = (key) => {
+      const found = Object.keys(value).find((candidate) => candidate.toLowerCase() === key);
+      const entry = found === undefined ? undefined : value[found];
+      return typeof entry === "string" ? entry.trim() : "";
+    };
+    const drawableId = field("id");
+    const name = field("name") || drawableId;
+    if (drawableId && name)
+      defs.push({ name, drawableId });
+  }
+  return defs;
+}
+var squash = (text) => text.toLowerCase().replace(/[^a-z0-9]/g, "");
+function groupMotion(motions, wanted) {
+  const groups = Object.keys(motions).filter((group) => (motions[group]?.length ?? 0) > 0);
+  for (const name of wanted) {
+    const group = groups.find((candidate) => squash(candidate) === name);
+    if (group)
+      return `${group}_id=random`;
+  }
+  return "none";
+}
+function suggestAreaMotion(area, motions) {
+  const name = squash(area).replace(/^hitarea/, "").replace(/hitarea$/, "");
+  if (!name)
+    return "none";
+  return groupMotion(motions, [`tap${name}`, `touch${name}`, `${name}tap`, `${name}touch`, `click${name}`]);
+}
+function suggestClickMotion(motions) {
+  return groupMotion(motions, ["tap", "touch", "click", "tapbody", "touchbody"]);
+}
+var unset = (mapping) => !mapping || mapping.motion === "none" && mapping.expression === "none" && mapping.message === "";
+function applyTapMotions(settings, areaNames, motions) {
+  let changed = 0;
+  for (const area of areaNames) {
+    const mapping = settings.hit_areas[area];
+    if (!unset(mapping))
+      continue;
+    const motion = suggestAreaMotion(area, motions);
+    if (motion === "none")
+      continue;
+    settings.hit_areas[area] = { expression: "none", motion, message: mapping?.message ?? "" };
+    changed++;
+  }
+  if (unset(settings.animation_click)) {
+    const motion = suggestClickMotion(motions);
+    if (motion !== "none") {
+      settings.animation_click.motion = motion;
+      changed++;
+    }
+  }
+  return changed;
+}
+
 // vendor/live2dcubismcore.min.js
 var live2dcubismcore_min_default = `/**
  * Live2D Cubism Core
@@ -739,6 +803,8 @@ function defaultModelSettings(hitAreaNames = []) {
     animation_default: { expression: "none", motion: "none", loop: false },
     animation_click: { expression: "none", motion: "none", message: "" },
     hit_areas: {},
+    custom_hit_areas: [],
+    show_hit_areas: false,
     classify_mapping: {}
   };
   for (const label of CLASSIFY_EXPRESSIONS) {
@@ -809,6 +875,7 @@ function normalizeModelSettings(raw, hitAreaNames = []) {
     animation_default: { ...base.animation_default, ...value.animation_default ?? {} },
     animation_click: { ...base.animation_click, ...value.animation_click ?? {} },
     hit_areas: { ...base.hit_areas, ...value.hit_areas ?? {} },
+    custom_hit_areas: sanitizeCustomHitAreas(value.custom_hit_areas),
     classify_mapping: { ...base.classify_mapping, ...value.classify_mapping ?? {} }
   };
   return out;
@@ -840,6 +907,8 @@ function sanitizeModelSettings(raw) {
     out.classify_mapping = mappings(out.classify_mapping, {});
   if (out.hit_areas)
     out.hit_areas = mappings(out.hit_areas, { message: "" });
+  if (out.custom_hit_areas)
+    out.custom_hit_areas = sanitizeCustomHitAreas(out.custom_hit_areas);
   for (const key of ["animation_starter", "animation_default", "animation_click"]) {
     if (out[key])
       out[key] = pickTyped(out[key], base[key]);
@@ -858,6 +927,24 @@ var NUMBER_LIMITS = {
   mouth_open_speed: [0.1, 3],
   mouth_time_per_character: [0, 1000]
 };
+function sanitizeCustomHitAreas(raw) {
+  if (!Array.isArray(raw))
+    return [];
+  const out = [];
+  const unit = (value) => typeof value === "number" && Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : null;
+  for (const entry of raw) {
+    if (!isPlainObject(entry) || typeof entry.name !== "string")
+      continue;
+    const name = entry.name.trim().slice(0, 64);
+    const [x, y, width, height] = [entry.x, entry.y, entry.width, entry.height].map(unit);
+    if (!name || x === null || y === null || width === null || height === null)
+      continue;
+    if (out.some((area) => area.name === name))
+      continue;
+    out.push({ name, x, y, width: Math.min(width, 1 - x), height: Math.min(height, 1 - y) });
+  }
+  return out;
+}
 function isPlainObject(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -878,6 +965,11 @@ var MOTION_PRIORITY_IDLE = 1;
 var DEFAULT_LOOP_GROUP = "__live2d_avatars_default__";
 var EXPRESSION_HOLD_MS = 5000;
 var THUMBNAIL_DELAY_MS = 1500;
+var HIT_FLASH_MS = 600;
+var MIN_DRAWN_AREA = 0.01;
+var MODEL_AREA_COLOR = 4891647;
+var CUSTOM_AREA_COLOR = 16752704;
+var DRAWING_AREA_COLOR = 6217866;
 var EXTENSION_ID = "live2d_avatars";
 var INTERACTIVE_SELECTOR = [
   "input",
@@ -931,6 +1023,9 @@ function modelSize(model) {
     height: model.internalModel?.height || model.height || 1
   };
 }
+function isEmptyMapping(mapping) {
+  return !mapping || mapping.expression === "none" && mapping.motion === "none" && !mapping.message;
+}
 function describeFromBundle(bundleJson, cubism) {
   const expressions = [];
   const motions = {};
@@ -943,11 +1038,6 @@ function describeFromBundle(bundleJson, cubism) {
     for (const [group, defs] of Object.entries(refs.Motions ?? {})) {
       motions[group] = defs.map((def) => String(def.File ?? ""));
     }
-    for (const area of bundleJson?.HitAreas ?? []) {
-      const name = area?.Name ?? area?.Id;
-      if (name)
-        hitAreas.push(String(name));
-    }
   } else {
     for (const entry of bundleJson?.expressions ?? []) {
       expressions.push({
@@ -958,11 +1048,10 @@ function describeFromBundle(bundleJson, cubism) {
     for (const [group, defs] of Object.entries(bundleJson?.motions ?? {})) {
       motions[group] = defs.map((def) => loose(def, "file") ?? "");
     }
-    for (const area of bundleJson?.hit_areas ?? []) {
-      const name = loose(area, "name");
-      if (name)
-        hitAreas.push(name);
-    }
+  }
+  for (const def of hitAreaDefsFromBundle(bundleJson, cubism)) {
+    if (!hitAreas.includes(def.name))
+      hitAreas.push(def.name);
   }
   return { expressions, motions, hitAreas };
 }
@@ -983,6 +1072,7 @@ class Stage {
   descriptionCache = new Map;
   drag = null;
   suppressClick = false;
+  drawing = null;
   hoverFrame = null;
   hovering = false;
   listeners = [
@@ -991,8 +1081,9 @@ class Stage {
     [document, "pointerup", (event) => this.onPointerUp(event), { capture: true }],
     [document, "pointercancel", () => this.endDrag(), { capture: true }],
     [document, "click", (event) => this.onClickCapture(event), { capture: true }],
-    [document, "touchstart", (event) => this.drag && event.preventDefault(), { capture: true, passive: false }],
-    [document, "touchmove", (event) => this.drag && event.preventDefault(), { capture: true, passive: false }]
+    [document, "touchstart", (event) => this.capturing() && event.preventDefault(), { capture: true, passive: false }],
+    [document, "touchmove", (event) => this.capturing() && event.preventDefault(), { capture: true, passive: false }],
+    [document, "keydown", (event) => this.onKeyDown(event), { capture: true }]
   ];
   constructor(deps) {
     this.deps = deps;
@@ -1001,7 +1092,10 @@ class Stage {
     this.sharedColumns = new SharedColumns(EXTENSION_ID, () => this.updateColumns());
     this.sharedColumns.setHitTest((canvas, clientX, clientY) => {
       const entry = this.loaded.find((candidate) => candidate.canvas === canvas);
-      return entry && this.isOverModel(entry, this.toStagePoint({ clientX, clientY })) ? entry.characterId : null;
+      if (!entry)
+        return null;
+      const point = this.toStagePoint({ clientX, clientY });
+      return this.isOverModel(entry, point) || this.hitAreasAt(entry, point).length > 0 ? entry.characterId : null;
     });
   }
   destroy() {
@@ -1012,6 +1106,7 @@ class Stage {
       window.cancelAnimationFrame(this.hoverFrame);
     this.hoverFrame = null;
     this.setHovering(false);
+    this.cancelDrawing();
     this.teardownApp();
     this.sharedColumns.destroy();
     if (this.ticker !== null)
@@ -1211,9 +1306,13 @@ class Stage {
       idleGroup: model.internalModel.motionManager?.groups?.idle,
       loopingMotion: null,
       starterTimer: null,
-      thumbnailTimer: null
+      thumbnailTimer: null,
+      hitAreaDefs: hitAreaDefsFromBundle(json, bundle.cubism),
+      areaFrames: null,
+      flash: null
     };
     this.loaded.push(entry);
+    app.ticker.add(() => this.drawAreaFrames(entry));
     this.sortEntries();
     this.applyCursorParams(entry, modelSettings);
     this.applyLayout(entry, modelSettings);
@@ -1275,7 +1374,7 @@ class Stage {
       model.scale.set(box * 0.96 / Math.max(w, h));
       model.x = box / 2;
       model.y = box / 2;
-      const frames = entry.frames.map((frame) => [frame, frame.visible]);
+      const frames = [...entry.frames, ...entry.areaFrames ? [entry.areaFrames.container] : []].map((frame) => [frame, frame.visible]);
       for (const [frame] of frames)
         frame.visible = false;
       app.renderer.render(app.stage);
@@ -1518,9 +1617,16 @@ class Stage {
     } catch {}
     return false;
   }
+  capturing() {
+    return this.drag !== null || this.drawing?.press != null;
+  }
   onPointerDown(event) {
     if (event.button !== 0)
       return;
+    if (this.drawing) {
+      this.startDrawingPress(event);
+      return;
+    }
     const entry = this.modelAt(event);
     if (!entry)
       return;
@@ -1537,6 +1643,15 @@ class Stage {
     this.suppressClick = true;
   }
   onPointerMove(event) {
+    const press = this.drawing?.press;
+    if (press && event.pointerId === press.pointerId) {
+      event.preventDefault();
+      event.stopPropagation();
+      const entry = this.entryFor(this.drawing.characterId);
+      if (entry)
+        press.current = this.localPoint(entry, event);
+      return;
+    }
     const drag = this.drag;
     if (drag && event.pointerId === drag.pointerId) {
       event.preventDefault();
@@ -1559,7 +1674,12 @@ class Stage {
     if (event.pointerType === "mouse" && this.hoverFrame === null) {
       this.hoverFrame = window.requestAnimationFrame(() => {
         this.hoverFrame = null;
-        this.setHovering(this.modelAt(event) !== null);
+        if (this.drawing) {
+          const entry = this.entryFor(this.drawing.characterId);
+          this.setDrawCursor(!!entry && this.canvasReachableAt(entry, event) && this.onModelCanvas(entry, event));
+        } else {
+          this.setHovering(this.modelAt(event) !== null);
+        }
       });
     }
   }
@@ -1585,6 +1705,13 @@ class Stage {
     this.deps.layoutChanged();
   }
   onPointerUp(event) {
+    if (this.drawing?.press && event.pointerId === this.drawing.press.pointerId) {
+      event.preventDefault();
+      event.stopPropagation();
+      this.finishDrawingPress(event);
+      this.endDrag();
+      return;
+    }
     const drag = this.drag;
     if (!drag || event.pointerId !== drag.pointerId)
       return;
@@ -1618,32 +1745,14 @@ class Stage {
     return { x: event.clientX - (rect?.left ?? 0), y: event.clientY - (rect?.top ?? 0) };
   }
   async onModelClick(entry, event) {
-    const point = this.toStagePoint(event);
-    let hits = [];
-    try {
-      hits = await entry.model.hitTest(point.x, point.y) ?? [];
-    } catch {
-      hits = [];
-    }
     const settings = this.settingsFor(entry);
-    const modelHitAreas = entry.model.internalModel?.hitAreas ?? {};
-    let selected = null;
-    let selectedPriority = Number.POSITIVE_INFINITY;
-    for (const area of Object.keys(modelHitAreas)) {
-      if (!hits.includes(area))
-        continue;
-      const mapping = settings.hit_areas[area];
-      if (!mapping)
-        continue;
-      if (mapping.expression === "none" && mapping.motion === "none" && mapping.message === "")
-        continue;
-      const priority = Number(modelHitAreas[area]?.index ?? 0);
-      if (priority < selectedPriority) {
-        selected = mapping;
-        selectedPriority = priority;
-      }
-    }
-    const mapping = selected ?? settings.animation_click;
+    const hits = this.hitAreasAt(entry, this.toStagePoint(event), settings);
+    const hit = hits.reduce((best, next) => best && best.size <= next.size ? best : next, null);
+    const mapping = hit?.mapping ?? settings.animation_click;
+    if (hit)
+      entry.flash = { name: hit.name, until: performance.now() + HIT_FLASH_MS };
+    entry.canvas.dataset.live2dTap = hit?.name ?? "";
+    entry.canvas.dataset.live2dTaps = String(Number(entry.canvas.dataset.live2dTaps ?? 0) + 1);
     if (mapping.message && mapping.message !== "") {
       if (this.previousInteraction.characterId === entry.characterId && this.previousInteraction.message === mapping.message) {
         this.deps.log("Same as last interaction, message not sent again.");
@@ -1656,6 +1765,219 @@ class Stage {
       await this.playExpression(entry.characterId, mapping.expression);
     if (mapping.motion !== "none")
       await this.playMotion(entry.characterId, mapping.motion);
+  }
+  localPoint(entry, point) {
+    const PIXI = window.PIXI;
+    const stagePoint = this.toStagePoint(point);
+    const local = entry.model.toLocal(new PIXI.Point(stagePoint.x, stagePoint.y));
+    return { x: local.x, y: local.y };
+  }
+  modelAreaRect(entry, def) {
+    const internal = entry.model?.internalModel;
+    const index = internal?.getDrawableIndex?.(def.drawableId);
+    if (typeof index !== "number" || index < 0)
+      return null;
+    const bounds = internal.getDrawableBounds(index, {});
+    const transform = internal.localTransform;
+    const a = transform.apply({ x: bounds.x, y: bounds.y });
+    const b = transform.apply({ x: bounds.x + bounds.width, y: bounds.y + bounds.height });
+    return { x: Math.min(a.x, b.x), y: Math.min(a.y, b.y), width: Math.abs(b.x - a.x), height: Math.abs(b.y - a.y) };
+  }
+  customAreaRect(entry, area) {
+    const { width, height } = modelSize(entry.model);
+    return { x: area.x * width, y: area.y * height, width: area.width * width, height: area.height * height };
+  }
+  hitAreasAt(entry, point, settings) {
+    const PIXI = window.PIXI;
+    if (!PIXI || !entry.model?.internalModel)
+      return [];
+    const modelSettings = settings ?? this.storedSettings(entry);
+    if (!modelSettings)
+      return [];
+    const hits = [];
+    try {
+      const local = entry.model.toLocal(new PIXI.Point(point.x, point.y));
+      const consider = (name, rect) => {
+        const mapping = modelSettings.hit_areas?.[name];
+        if (!rect || !mapping || isEmptyMapping(mapping))
+          return;
+        if (local.x < rect.x || local.y < rect.y || local.x > rect.x + rect.width || local.y > rect.y + rect.height)
+          return;
+        const existing = hits.find((hit) => hit.name === name);
+        const size = rect.width * rect.height;
+        if (existing)
+          existing.size = Math.min(existing.size, size);
+        else
+          hits.push({ name, mapping, size });
+      };
+      for (const area of modelSettings.custom_hit_areas ?? [])
+        consider(area.name, this.customAreaRect(entry, area));
+      for (const def of entry.hitAreaDefs)
+        consider(def.name, this.modelAreaRect(entry, def));
+    } catch {}
+    return hits;
+  }
+  storedSettings(entry) {
+    return this.deps.getSettings().characterModelsSettings[entry.characterId]?.[entry.modelId];
+  }
+  startDrawing(characterId, onDone) {
+    this.cancelDrawing();
+    if (!this.entryFor(characterId))
+      return false;
+    this.drawing = { characterId, onDone, press: null };
+    this.setHovering(false);
+    return true;
+  }
+  cancelDrawing() {
+    const drawing = this.drawing;
+    if (!drawing)
+      return;
+    this.drawing = null;
+    this.setDrawCursor(false);
+    drawing.onDone(null);
+  }
+  isDrawing(characterId) {
+    return this.drawing?.characterId === characterId;
+  }
+  onKeyDown(event) {
+    if (event.key !== "Escape" || !this.drawing)
+      return;
+    event.preventDefault();
+    event.stopPropagation();
+    this.cancelDrawing();
+  }
+  canvasReachableAt(entry, event) {
+    const target = event.target instanceof Element ? event.target : null;
+    if (target?.closest(INTERACTIVE_SELECTOR))
+      return false;
+    const canvas = entry.canvas;
+    const previous = canvas.style.pointerEvents;
+    canvas.style.pointerEvents = "auto";
+    try {
+      return document.elementFromPoint(event.clientX, event.clientY) === canvas;
+    } finally {
+      canvas.style.pointerEvents = previous;
+    }
+  }
+  onModelCanvas(entry, event) {
+    const point = this.localPoint(entry, event);
+    const { width, height } = modelSize(entry.model);
+    return point.x >= 0 && point.y >= 0 && point.x <= width && point.y <= height;
+  }
+  setDrawCursor(on) {
+    document.documentElement.classList.toggle("live2d-avatars-drawing", on);
+  }
+  startDrawingPress(event) {
+    const drawing = this.drawing;
+    const entry = this.entryFor(drawing.characterId);
+    if (!entry) {
+      this.cancelDrawing();
+      return;
+    }
+    if (!this.canvasReachableAt(entry, event) || !this.onModelCanvas(entry, event))
+      return;
+    const point = this.localPoint(entry, event);
+    event.preventDefault();
+    event.stopPropagation();
+    drawing.press = { pointerId: event.pointerId, start: point, current: point };
+    this.suppressClick = true;
+  }
+  finishDrawingPress(event) {
+    const drawing = this.drawing;
+    const press = drawing.press;
+    drawing.press = null;
+    const entry = this.entryFor(drawing.characterId);
+    if (!entry) {
+      this.cancelDrawing();
+      return;
+    }
+    press.current = this.localPoint(entry, event);
+    const { width, height } = modelSize(entry.model);
+    const clamp = (value) => Math.min(1, Math.max(0, value));
+    const x1 = clamp(Math.min(press.start.x, press.current.x) / width);
+    const x2 = clamp(Math.max(press.start.x, press.current.x) / width);
+    const y1 = clamp(Math.min(press.start.y, press.current.y) / height);
+    const y2 = clamp(Math.max(press.start.y, press.current.y) / height);
+    if (x2 - x1 < MIN_DRAWN_AREA || y2 - y1 < MIN_DRAWN_AREA)
+      return;
+    this.drawing = null;
+    this.setDrawCursor(false);
+    const round = (value) => Math.round(value * 1e4) / 1e4;
+    drawing.onDone({ name: "", x: round(x1), y: round(y1), width: round(x2 - x1), height: round(y2 - y1) });
+  }
+  drawAreaFrames(entry) {
+    const PIXI = window.PIXI;
+    if (!PIXI || !this.loaded.includes(entry))
+      return;
+    const settings = this.storedSettings(entry);
+    const drawing = this.drawing?.characterId === entry.characterId ? this.drawing : null;
+    const show = !!settings && (settings.show_hit_areas || this.deps.getSettings().global.showFrames || drawing !== null);
+    if (!show) {
+      if (entry.areaFrames)
+        entry.areaFrames.container.visible = false;
+      return;
+    }
+    try {
+      if (!entry.areaFrames) {
+        const container = new PIXI.Container;
+        const graphics = new PIXI.Graphics;
+        container.addChild(graphics);
+        entry.model.addChild(container);
+        entry.areaFrames = { container, graphics, labels: new Map };
+      }
+      const frames = entry.areaFrames;
+      frames.container.visible = true;
+      const graphics = frames.graphics;
+      graphics.clear();
+      const pixel = 1 / (Math.abs(entry.model.scale.x) || 1);
+      const now = performance.now();
+      const flash = entry.flash && entry.flash.until > now ? entry.flash.name : null;
+      const seen = new Set;
+      const outline = (name, rect, color) => {
+        const mapped = !isEmptyMapping(settings.hit_areas?.[name]);
+        graphics.lineStyle(2 * pixel, color, mapped ? 1 : 0.6);
+        graphics.beginFill(color, name === flash ? 0.4 : 0.12);
+        graphics.drawRect(rect.x, rect.y, rect.width, rect.height);
+        graphics.endFill();
+        let label = frames.labels.get(name);
+        if (!label) {
+          label = new PIXI.Text(name, {
+            fontFamily: "sans-serif",
+            fontSize: 14,
+            fill: 16777215,
+            stroke: 0,
+            strokeThickness: 3
+          });
+          frames.labels.set(name, label);
+          frames.container.addChild(label);
+        }
+        label.visible = true;
+        label.scale.set(pixel);
+        label.position.set(rect.x + 4 * pixel, rect.y + 2 * pixel);
+        seen.add(name);
+      };
+      for (const def of entry.hitAreaDefs) {
+        const rect = this.modelAreaRect(entry, def);
+        if (rect)
+          outline(def.name, rect, MODEL_AREA_COLOR);
+      }
+      for (const area of settings.custom_hit_areas ?? [])
+        outline(area.name, this.customAreaRect(entry, area), CUSTOM_AREA_COLOR);
+      const press = drawing?.press;
+      if (press) {
+        graphics.lineStyle(2 * pixel, DRAWING_AREA_COLOR, 1);
+        graphics.beginFill(DRAWING_AREA_COLOR, 0.2);
+        graphics.drawRect(Math.min(press.start.x, press.current.x), Math.min(press.start.y, press.current.y), Math.abs(press.current.x - press.start.x), Math.abs(press.current.y - press.start.y));
+        graphics.endFill();
+      }
+      for (const [name, label] of frames.labels) {
+        if (seen.has(name))
+          continue;
+        frames.container.removeChild(label);
+        label.destroy();
+        frames.labels.delete(name);
+      }
+    } catch {}
   }
   tick() {
     const globals = this.deps.getSettings().global;
@@ -1794,16 +2116,15 @@ class Stage {
       foreground.width = entry.model.internalModel.width;
       foreground.height = entry.model.internalModel.height;
       foreground.alpha = 0.2;
-      const hitFrames = new PIXI.live2d.HitAreaFrames;
-      entry.model.addChild(foreground);
-      entry.model.addChild(hitFrames);
-      entry.frames = [foreground, hitFrames];
+      entry.model.addChildAt(foreground, entry.clip ? 1 : 0);
+      entry.frames = [foreground];
     } catch (error) {
       this.deps.log(`Show frames failed: ${String(error)}`);
     }
   }
   teardownApp() {
     this.loadToken++;
+    this.cancelDrawing();
     if (this.drag)
       this.suppressClick = false;
     this.drag = null;
@@ -2005,6 +2326,7 @@ class SettingsUI {
   fileStatusText = "";
   mounted = [];
   pendingMounts = [];
+  hitAreasOpen = false;
   constructor(controller) {
     this.controller = controller;
   }
@@ -2510,34 +2832,193 @@ Used by ${used} character${used === 1 ? "" : "s"}` : ""}`;
     const classifySection = section("Emotion mappings", classify);
     classifySection.open = false;
     host.appendChild(classifySection);
-    const hitAreaNames = new Set([...description.hitAreas, ...Object.keys(modelSettings.hit_areas)]);
-    if (hitAreaNames.size > 0) {
-      const hitAreas = el("div");
-      for (const area of hitAreaNames) {
-        if (!modelSettings.hit_areas[area]) {
-          modelSettings.hit_areas[area] = { expression: "none", motion: "none", message: "" };
-        }
-        const mapping = modelSettings.hit_areas[area];
-        const message = el("input", "l2d-input");
-        message.type = "text";
-        message.placeholder = "Message";
-        message.value = mapping.message;
-        message.addEventListener("change", () => {
-          mapping.message = message.value;
-          controller.saveDebounced();
-        });
-        hitAreas.appendChild(row(el("span", "l2d-emotion", area), select(expressionOptions(description), mapping.expression, (value) => {
-          mapping.expression = value;
-          controller.saveDebounced();
-        }), select(motionOptions(description), mapping.motion, (value) => {
-          mapping.motion = value;
-          controller.saveDebounced();
-        }), message, button("▶", () => play(mapping))));
+    const hitSection = section("Hit areas");
+    hitSection.classList.add("l2d-hit-areas");
+    const hitDetails = hitSection;
+    hitDetails.open = this.hitAreasOpen;
+    hitDetails.addEventListener("toggle", () => {
+      this.hitAreasOpen = hitDetails.open;
+    });
+    const hitBody = el("div");
+    hitSection.appendChild(hitBody);
+    this.renderHitAreas(hitBody, characterId, modelId, description, modelSettings);
+    host.appendChild(hitSection);
+  }
+  renderHitAreas(host, characterId, modelId, description, modelSettings) {
+    const controller = this.controller;
+    const stage = controller.stage;
+    const rerender = () => {
+      host.replaceChildren();
+      this.renderHitAreas(host, characterId, modelId, description, modelSettings);
+    };
+    const play = (mapping) => {
+      stage.playExpression(characterId, mapping.expression);
+      stage.playMotion(characterId, mapping.motion, true);
+    };
+    const modelAreas = description.hitAreas;
+    const custom = modelSettings.custom_hit_areas;
+    const taken = (name) => modelAreas.includes(name) || custom.some((area) => area.name === name);
+    const hint = el("span", "l2d-dim", "");
+    host.appendChild(checkbox("Show hit areas on the model", modelSettings.show_hit_areas, (value) => {
+      modelSettings.show_hit_areas = value;
+      controller.saveDebounced();
+    }));
+    host.appendChild(note("Tap a hit area on the model to play what it’s set to. Where areas overlap, the smallest one wins; " + "a tap anywhere else on the model plays the “On click” animation."));
+    const mappingControls = (area) => {
+      const mapping = modelSettings.hit_areas[area] ??= { expression: "none", motion: "none", message: "" };
+      const message = el("input", "l2d-input");
+      message.type = "text";
+      message.placeholder = "Message";
+      message.title = "Message sent to the chat when this area is tapped (optional)";
+      message.value = mapping.message;
+      message.addEventListener("change", () => {
+        mapping.message = message.value;
+        controller.saveDebounced();
+      });
+      const expression = select(expressionOptions(description), mapping.expression, (value) => {
+        mapping.expression = value;
+        controller.saveDebounced();
+      });
+      expression.title = "Expression";
+      const motion = select(motionOptions(description), mapping.motion, (value) => {
+        mapping.motion = value;
+        controller.saveDebounced();
+      });
+      motion.title = "Motion";
+      const test = button("▶", () => play(mapping));
+      test.title = "Play";
+      return [expression, motion, message, test];
+    };
+    const draw = (name, done) => {
+      const drawingHint = `Drag on the model to draw “${name}”. Esc cancels.`;
+      if (!stage.isOnStage(characterId, modelId)) {
+        hint.textContent = "Show the model first, then try again.";
+        return;
       }
-      const hitSection = section("Hit areas", hitAreas);
-      hitSection.open = false;
-      host.appendChild(hitSection);
+      let watch = 0;
+      let cancel = null;
+      const started = stage.startDrawing(characterId, (rect) => {
+        window.clearInterval(watch);
+        cancel?.remove();
+        if (!rect) {
+          if (hint.textContent === drawingHint)
+            hint.textContent = "Drawing cancelled.";
+          return;
+        }
+        done(rect);
+      });
+      if (!started) {
+        hint.textContent = "Show the model first, then try again.";
+        return;
+      }
+      hint.textContent = drawingHint;
+      cancel = button("Cancel", () => stage.cancelDrawing());
+      hint.after(cancel);
+      watch = window.setInterval(() => {
+        if (!hint.isConnected || hint.offsetParent === null)
+          stage.cancelDrawing();
+      }, 500);
+    };
+    if (modelAreas.length > 0) {
+      host.appendChild(el("div", "l2d-anim-title", "From the model file"));
+      for (const area of modelAreas) {
+        host.appendChild(row(el("span", "l2d-emotion", area), ...mappingControls(area)));
+      }
+    } else {
+      host.appendChild(note("This model’s file defines no hit areas. Draw your own below."));
     }
+    if (custom.length > 0)
+      host.appendChild(el("div", "l2d-anim-title", "Drawn on the model"));
+    for (const area of custom) {
+      const name = el("input", "l2d-input l2d-area-name");
+      name.type = "text";
+      name.value = area.name;
+      name.title = "Area name";
+      name.addEventListener("change", () => {
+        const next = name.value.trim().slice(0, 64);
+        if (next === area.name)
+          return;
+        if (!next || taken(next)) {
+          hint.textContent = next ? `There’s already an area called “${next}”.` : "An area needs a name.";
+          name.value = area.name;
+          return;
+        }
+        const mapping = modelSettings.hit_areas[area.name];
+        if (!modelAreas.includes(area.name))
+          delete modelSettings.hit_areas[area.name];
+        if (mapping)
+          modelSettings.hit_areas[next] = mapping;
+        area.name = next;
+        controller.saveDebounced();
+        rerender();
+      });
+      const redraw = button("Redraw", () => draw(area.name, (rect) => {
+        Object.assign(area, { x: rect.x, y: rect.y, width: rect.width, height: rect.height });
+        controller.saveDebounced();
+        hint.textContent = `Redrew “${area.name}”.`;
+      }));
+      redraw.title = "Drag a new rectangle for this area on the model";
+      const remove = button("✕", () => {
+        const index = custom.indexOf(area);
+        if (index !== -1)
+          custom.splice(index, 1);
+        if (!modelAreas.includes(area.name))
+          delete modelSettings.hit_areas[area.name];
+        controller.saveDebounced();
+        rerender();
+      });
+      remove.title = `Delete ${area.name}`;
+      remove.setAttribute("aria-label", `Delete ${area.name}`);
+      host.appendChild(row(name, ...mappingControls(area.name), redraw, remove));
+    }
+    const newName = el("input", "l2d-input l2d-area-name");
+    newName.type = "text";
+    newName.placeholder = "New area, e.g. Head";
+    const add = button("Add area", () => {
+      const name = newName.value.trim().slice(0, 64);
+      if (!name) {
+        hint.textContent = "Name the area first.";
+        return;
+      }
+      if (taken(name)) {
+        hint.textContent = `There’s already an area called “${name}”.`;
+        return;
+      }
+      draw(name, (rect) => {
+        if (taken(name))
+          return;
+        custom.push({ ...rect, name });
+        const mapping = modelSettings.hit_areas[name];
+        if (!mapping || mapping.expression === "none" && mapping.motion === "none" && !mapping.message) {
+          modelSettings.hit_areas[name] = {
+            expression: "none",
+            motion: suggestAreaMotion(name, description.motions),
+            message: mapping?.message ?? ""
+          };
+        }
+        modelSettings.show_hit_areas = true;
+        controller.saveDebounced();
+        rerender();
+      });
+    });
+    add.title = "Name the area, then drag a rectangle over that part of the model";
+    newName.addEventListener("keydown", (event) => {
+      if (event.key === "Enter")
+        add.click();
+    });
+    const suggest = button("Use the model’s tap motions", () => {
+      const names = [...modelAreas, ...custom.map((area) => area.name)];
+      const count = applyTapMotions(modelSettings, names, description.motions);
+      if (count === 0) {
+        hint.textContent = "No tap motions to add: the model has none named for these areas, or they’re already set.";
+        return;
+      }
+      controller.saveDebounced();
+      rerender();
+    });
+    suggest.title = "Set areas (and “On click”) that play nothing yet to the model’s motion groups named for tapping them, like “Tap”, “TapHead” or “touch_body”";
+    host.appendChild(row(newName, add, suggest));
+    host.appendChild(row(hint));
   }
   animationRow(label, characterId, description, mapping, withDelay) {
     const controller = this.controller;
@@ -2580,6 +3061,7 @@ var UI_CSS = `
 .l2d-slider-head { display: flex; justify-content: space-between; color: var(--lumiverse-text-muted); }
 .l2d-slider-value { color: var(--lumiverse-text); }
 .l2d-emotion { min-width: 110px; color: var(--lumiverse-text-muted); }
+.l2d-input.l2d-area-name { flex: 0 1 110px; min-width: 80px; }
 .l2d-model-name { font-weight: 600; }
 .l2d-anim { border-top: 1px solid var(--lumiverse-border); padding-top: 6px; margin-top: 6px; }
 .l2d-anim-title { font-weight: 600; color: var(--lumiverse-text-muted); }
@@ -2725,6 +3207,7 @@ var STAGE_CSS = `
 .live2d-avatars-overlay { position: fixed; inset: 0; pointer-events: none; z-index: 4; }
 .live2d-avatars-canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; background: transparent; }
 html.live2d-avatars-hover, html.live2d-avatars-hover * { cursor: grab !important; }
+html.live2d-avatars-drawing, html.live2d-avatars-drawing * { cursor: crosshair !important; }
 `;
 var TAB_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4.2"/><path d="M9.5 7.5h.01M14.5 7.5h.01"/><path d="M10 10c.6.6 1.3.9 2 .9s1.4-.3 2-.9"/><path d="M4.5 21c.8-3.6 3.9-6 7.5-6s6.7 2.4 7.5 6"/></svg>';
 function downloadJson(fileName, value) {
@@ -2766,7 +3249,10 @@ function setup(ctx) {
     const byCharacter = settings.characterModelsSettings[characterId] ??= {};
     let modelSettings = byCharacter[modelId];
     if (!modelSettings) {
-      modelSettings = preset !== undefined && preset !== null ? normalizeModelSettings(preset, description?.hitAreas ?? []) : normalizeModelSettings(null, description?.hitAreas ?? []);
+      const hasPreset = preset !== undefined && preset !== null;
+      modelSettings = normalizeModelSettings(hasPreset ? preset : null, description?.hitAreas ?? []);
+      if (!hasPreset && description)
+        applyTapMotions(modelSettings, description.hitAreas, description.motions);
       byCharacter[modelId] = modelSettings;
       saveDebounced();
     } else {

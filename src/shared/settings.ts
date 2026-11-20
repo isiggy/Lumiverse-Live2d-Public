@@ -80,6 +80,19 @@ export interface ClickAnimation extends AnimationMapping {
   message: string; // user message to send on click ('' = none)
 }
 
+/**
+ * A hit area the user drew on the model, for models whose file defines none
+ * (or not the ones wanted). The rectangle is in fractions of the model's
+ * canvas, from its top-left corner, so it turns and scales with the model.
+ */
+export interface CustomHitArea {
+  name: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 export interface ModelSettings {
   scale: number;
   x: number; // percent offset from center, -100..100
@@ -95,7 +108,12 @@ export interface ModelSettings {
   animation_starter: StarterAnimation;
   animation_default: DefaultAnimation;
   animation_click: ClickAnimation;
+  /** What a tap on each hit area plays, by area name: the model file's areas and the user's own. */
   hit_areas: Record<string, ClickAnimation>;
+  /** Hit areas the user drew, checked along with the model file's. */
+  custom_hit_areas: CustomHitArea[];
+  /** Outline the hit areas on the model. */
+  show_hit_areas: boolean;
   classify_mapping: Record<string, AnimationMapping>;
 }
 
@@ -202,6 +220,8 @@ export function defaultModelSettings(hitAreaNames: string[] = []): ModelSettings
     animation_default: { expression: 'none', motion: 'none', loop: false },
     animation_click: { expression: 'none', motion: 'none', message: '' },
     hit_areas: {},
+    custom_hit_areas: [],
+    show_hit_areas: false,
     classify_mapping: {},
   };
   for (const label of CLASSIFY_EXPRESSIONS) {
@@ -275,6 +295,7 @@ export function normalizeModelSettings(raw: unknown, hitAreaNames: string[] = []
     animation_default: { ...base.animation_default, ...(value.animation_default ?? {}) },
     animation_click: { ...base.animation_click, ...(value.animation_click ?? {}) },
     hit_areas: { ...base.hit_areas, ...(value.hit_areas ?? {}) },
+    custom_hit_areas: sanitizeCustomHitAreas(value.custom_hit_areas),
     classify_mapping: { ...base.classify_mapping, ...(value.classify_mapping ?? {}) },
   };
   return out;
@@ -309,6 +330,7 @@ export function sanitizeModelSettings(raw: unknown): Partial<ModelSettings> {
   if (out.cursor_param) out.cursor_param = strings(out.cursor_param);
   if (out.classify_mapping) out.classify_mapping = mappings(out.classify_mapping, {});
   if (out.hit_areas) out.hit_areas = mappings(out.hit_areas, { message: '' });
+  if (out.custom_hit_areas) out.custom_hit_areas = sanitizeCustomHitAreas(out.custom_hit_areas);
   for (const key of ['animation_starter', 'animation_default', 'animation_click'] as const) {
     if (out[key]) out[key] = pickTyped(out[key], base[key] as Record<string, unknown>);
   }
@@ -326,6 +348,22 @@ const NUMBER_LIMITS: Record<string, [number, number]> = {
   mouth_open_speed: [0.1, 3],
   mouth_time_per_character: [0, 1000],
 };
+
+/** Well-formed custom hit areas only, with unique non-empty names and rectangles clamped to the canvas. */
+export function sanitizeCustomHitAreas(raw: unknown): CustomHitArea[] {
+  if (!Array.isArray(raw)) return [];
+  const out: CustomHitArea[] = [];
+  const unit = (value: unknown) => (typeof value === 'number' && Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : null);
+  for (const entry of raw) {
+    if (!isPlainObject(entry) || typeof entry.name !== 'string') continue;
+    const name = entry.name.trim().slice(0, 64);
+    const [x, y, width, height] = [entry.x, entry.y, entry.width, entry.height].map(unit);
+    if (!name || x === null || y === null || width === null || height === null) continue;
+    if (out.some((area) => area.name === name)) continue;
+    out.push({ name, x, y, width: Math.min(width, 1 - x), height: Math.min(height, 1 - y) });
+  }
+  return out;
+}
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);

@@ -28,10 +28,12 @@ import {
   sameColumns,
   sameStack,
 } from './columns';
+import { type HitAreaDef, hitAreaDefsFromBundle } from './hit-areas';
 import { ensureLive2DRuntime } from './runtime';
 import { squareThumbnail, THUMBNAIL_RENDER_PIXELS } from './thumbnail';
 import {
   type ClickAnimation,
+  type CustomHitArea,
   type Live2DSettings,
   type ModelRecord,
   type ModelSettings,
@@ -51,6 +53,14 @@ const DEFAULT_LOOP_GROUP = '__live2d_avatars_default__';
 const EXPRESSION_HOLD_MS = 5000;
 /** How long a model has been on stage before its first thumbnail is taken (its textures and idle pose have settled). */
 const THUMBNAIL_DELAY_MS = 1500;
+/** How long a tapped hit area stays highlighted while hit areas are shown. */
+const HIT_FLASH_MS = 600;
+/** Smallest hit area that can be drawn, as a fraction of the model canvas's side. */
+const MIN_DRAWN_AREA = 0.01;
+/** Outline colors: hit areas from the model file, the user's own, and one being drawn. */
+const MODEL_AREA_COLOR = 0x4aa3ff;
+const CUSTOM_AREA_COLOR = 0xffa040;
+const DRAWING_AREA_COLOR = 0x5ee08a;
 /** This extension's id in the registry shared with the Spine extension (columns.ts). */
 const EXTENSION_ID = 'live2d_avatars';
 
@@ -137,6 +147,27 @@ interface LoadedEntry {
   loopingMotion: string | null;
   starterTimer: number | null;
   thumbnailTimer: number | null;
+  /** Hit areas from the model file. */
+  hitAreaDefs: HitAreaDef[];
+  /** Outlines and labels of the hit areas, a child of the model; null until first shown. */
+  areaFrames: { container: any; graphics: any; labels: Map<string, any> } | null;
+  /** The hit area last tapped, highlighted for a moment while hit areas are shown. */
+  flash: { name: string; until: number } | null;
+}
+
+/** A hit area under a point: its name, what a tap on it plays, and its size (to prefer the smallest). */
+interface AreaHit {
+  name: string;
+  mapping: ClickAnimation;
+  size: number;
+}
+
+/** A rectangle in the model's local coordinates (model canvas units, y down). */
+interface LocalRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
 }
 
 /** A model's column on the stage, in host CSS pixels. */
@@ -191,6 +222,10 @@ function modelSize(model: any): { width: number; height: number } {
   };
 }
 
+function isEmptyMapping(mapping: ClickAnimation | undefined): boolean {
+  return !mapping || (mapping.expression === 'none' && mapping.motion === 'none' && !mapping.message);
+}
+
 export function describeFromBundle(bundleJson: any, cubism: 2 | 4): Omit<ModelDescription, 'parameterIds'> {
   const expressions: Array<{ name: string; file: string }> = [];
   const motions: Record<string, string[]> = {};
@@ -204,10 +239,6 @@ export function describeFromBundle(bundleJson: any, cubism: 2 | 4): Omit<ModelDe
     for (const [group, defs] of Object.entries<any>(refs.Motions ?? {})) {
       motions[group] = (defs as any[]).map((def) => String(def.File ?? ''));
     }
-    for (const area of bundleJson?.HitAreas ?? []) {
-      const name = area?.Name ?? area?.Id;
-      if (name) hitAreas.push(String(name));
-    }
   } else {
     for (const entry of bundleJson?.expressions ?? []) {
       expressions.push({
@@ -218,10 +249,9 @@ export function describeFromBundle(bundleJson: any, cubism: 2 | 4): Omit<ModelDe
     for (const [group, defs] of Object.entries<any>(bundleJson?.motions ?? {})) {
       motions[group] = (defs as any[]).map((def) => loose(def, 'file') ?? '');
     }
-    for (const area of bundleJson?.hit_areas ?? []) {
-      const name = loose(area, 'name');
-      if (name) hitAreas.push(name);
-    }
+  }
+  for (const def of hitAreaDefsFromBundle(bundleJson, cubism)) {
+    if (!hitAreas.includes(def.name)) hitAreas.push(def.name);
   }
   return { expressions, motions, hitAreas };
 }
@@ -245,6 +275,12 @@ export class Stage {
   private drag: { entry: LoadedEntry; pointerId: number; offsetX: number; offsetY: number; moved: boolean } | null =
     null;
   private suppressClick = false;
+  /** Drawing a hit area on a model (Model settings > Hit areas > Add area / Redraw). */
+  private drawing: {
+    characterId: string;
+    onDone: (rect: CustomHitArea | null) => void;
+    press: { pointerId: number; start: { x: number; y: number }; current: { x: number; y: number } } | null;
+  } | null = null;
   private hoverFrame: number | null = null;
   private hovering = false;
 
@@ -256,8 +292,9 @@ export class Stage {
     [document, 'pointerup', (event) => this.onPointerUp(event as PointerEvent), { capture: true }],
     [document, 'pointercancel', () => this.endDrag(), { capture: true }],
     [document, 'click', (event) => this.onClickCapture(event as MouseEvent), { capture: true }],
-    [document, 'touchstart', (event) => this.drag && event.preventDefault(), { capture: true, passive: false }],
-    [document, 'touchmove', (event) => this.drag && event.preventDefault(), { capture: true, passive: false }],
+    [document, 'touchstart', (event) => this.capturing() && event.preventDefault(), { capture: true, passive: false }],
+    [document, 'touchmove', (event) => this.capturing() && event.preventDefault(), { capture: true, passive: false }],
+    [document, 'keydown', (event) => this.onKeyDown(event as KeyboardEvent), { capture: true }],
   ];
 
   constructor(private deps: StageDeps) {
@@ -265,7 +302,9 @@ export class Stage {
     this.sharedColumns = new SharedColumns(EXTENSION_ID, () => this.updateColumns());
     this.sharedColumns.setHitTest((canvas, clientX, clientY) => {
       const entry = this.loaded.find((candidate) => candidate.canvas === canvas);
-      return entry && this.isOverModel(entry, this.toStagePoint({ clientX, clientY })) ? entry.characterId : null;
+      if (!entry) return null;
+      const point = this.toStagePoint({ clientX, clientY });
+      return this.isOverModel(entry, point) || this.hitAreasAt(entry, point).length > 0 ? entry.characterId : null;
     });
   }
 
@@ -276,6 +315,7 @@ export class Stage {
     if (this.hoverFrame !== null) window.cancelAnimationFrame(this.hoverFrame);
     this.hoverFrame = null;
     this.setHovering(false);
+    this.cancelDrawing();
     this.teardownApp();
     this.sharedColumns.destroy();
     if (this.ticker !== null) window.clearInterval(this.ticker);
@@ -513,9 +553,13 @@ export class Stage {
       loopingMotion: null,
       starterTimer: null,
       thumbnailTimer: null,
+      hitAreaDefs: hitAreaDefsFromBundle(json, bundle.cubism),
+      areaFrames: null,
+      flash: null,
     };
     // Owned by the stage from here on, so teardown frees it.
     this.loaded.push(entry);
+    app.ticker.add(() => this.drawAreaFrames(entry));
     this.sortEntries();
 
     this.applyCursorParams(entry, modelSettings);
@@ -588,7 +632,9 @@ export class Stage {
       model.scale.set((box * 0.96) / Math.max(w, h));
       model.x = box / 2;
       model.y = box / 2;
-      const frames = entry.frames.map((frame) => [frame, frame.visible] as const);
+      const frames = [...entry.frames, ...(entry.areaFrames ? [entry.areaFrames.container] : [])].map(
+        (frame) => [frame, frame.visible] as const,
+      );
       for (const [frame] of frames) frame.visible = false;
       app.renderer.render(app.stage);
       for (const [frame, visible] of frames) frame.visible = visible;
@@ -896,8 +942,17 @@ export class Stage {
     return false;
   }
 
+  /** Whether a press on a model is being followed (a drag or a hit area being drawn), so touch mustn't scroll. */
+  private capturing(): boolean {
+    return this.drag !== null || this.drawing?.press != null;
+  }
+
   private onPointerDown(event: PointerEvent): void {
     if (event.button !== 0) return;
+    if (this.drawing) {
+      this.startDrawingPress(event);
+      return;
+    }
     const entry = this.modelAt(event);
     if (!entry) return;
     event.preventDefault();
@@ -914,6 +969,14 @@ export class Stage {
   }
 
   private onPointerMove(event: PointerEvent): void {
+    const press = this.drawing?.press;
+    if (press && event.pointerId === press.pointerId) {
+      event.preventDefault();
+      event.stopPropagation();
+      const entry = this.entryFor(this.drawing!.characterId);
+      if (entry) press.current = this.localPoint(entry, event);
+      return;
+    }
     const drag = this.drag;
     if (drag && event.pointerId === drag.pointerId) {
       event.preventDefault();
@@ -937,7 +1000,12 @@ export class Stage {
     if (event.pointerType === 'mouse' && this.hoverFrame === null) {
       this.hoverFrame = window.requestAnimationFrame(() => {
         this.hoverFrame = null;
-        this.setHovering(this.modelAt(event) !== null);
+        if (this.drawing) {
+          const entry = this.entryFor(this.drawing.characterId);
+          this.setDrawCursor(!!entry && this.canvasReachableAt(entry, event) && this.onModelCanvas(entry, event));
+        } else {
+          this.setHovering(this.modelAt(event) !== null);
+        }
       });
     }
   }
@@ -964,6 +1032,13 @@ export class Stage {
   }
 
   private onPointerUp(event: PointerEvent): void {
+    if (this.drawing?.press && event.pointerId === this.drawing.press.pointerId) {
+      event.preventDefault();
+      event.stopPropagation();
+      this.finishDrawingPress(event);
+      this.endDrag();
+      return;
+    }
     const drag = this.drag;
     if (!drag || event.pointerId !== drag.pointerId) return;
     event.preventDefault();
@@ -999,32 +1074,21 @@ export class Stage {
     return { x: event.clientX - (rect?.left ?? 0), y: event.clientY - (rect?.top ?? 0) };
   }
 
+  /**
+   * A tap on a model (a press and release without dragging): play what its hit
+   * area under the pointer is set to, or the "On click" animation when the
+   * pointer is on no hit area with something set. Where areas overlap (a head
+   * inside a body), the smallest wins.
+   */
   private async onModelClick(entry: LoadedEntry, event: PointerEvent): Promise<void> {
-    const point = this.toStagePoint(event);
-    let hits: string[] = [];
-    try {
-      hits = (await entry.model.hitTest(point.x, point.y)) ?? [];
-    } catch {
-      hits = [];
-    }
     const settings = this.settingsFor(entry);
-    const modelHitAreas = entry.model.internalModel?.hitAreas ?? {};
-
-    // Pick the mapped hit area with the highest priority (lowest index), as ST does.
-    let selected: ClickAnimation | null = null;
-    let selectedPriority = Number.POSITIVE_INFINITY;
-    for (const area of Object.keys(modelHitAreas)) {
-      if (!hits.includes(area)) continue;
-      const mapping = settings.hit_areas[area];
-      if (!mapping) continue;
-      if (mapping.expression === 'none' && mapping.motion === 'none' && mapping.message === '') continue;
-      const priority = Number(modelHitAreas[area]?.index ?? 0);
-      if (priority < selectedPriority) {
-        selected = mapping;
-        selectedPriority = priority;
-      }
-    }
-    const mapping = selected ?? settings.animation_click;
+    const hits = this.hitAreasAt(entry, this.toStagePoint(event), settings);
+    const hit = hits.reduce<AreaHit | null>((best, next) => (best && best.size <= next.size ? best : next), null);
+    const mapping = hit?.mapping ?? settings.animation_click;
+    if (hit) entry.flash = { name: hit.name, until: performance.now() + HIT_FLASH_MS };
+    // For tests and debugging: what the last tap hit ('' for the model outside any hit area).
+    entry.canvas.dataset.live2dTap = hit?.name ?? '';
+    entry.canvas.dataset.live2dTaps = String(Number(entry.canvas.dataset.live2dTaps ?? 0) + 1);
 
     if (mapping.message && mapping.message !== '') {
       if (
@@ -1040,6 +1104,255 @@ export class Stage {
 
     if (mapping.expression !== 'none') await this.playExpression(entry.characterId, mapping.expression);
     if (mapping.motion !== 'none') await this.playMotion(entry.characterId, mapping.motion);
+  }
+
+  // ── Hit areas ─────────────────────────────────────────────────────────────
+
+  /** A stage point in the model's local coordinates (model canvas units, turning and scaling with it). */
+  private localPoint(entry: LoadedEntry, point: { clientX: number; clientY: number }): { x: number; y: number } {
+    const PIXI = window.PIXI;
+    const stagePoint = this.toStagePoint(point);
+    const local = entry.model.toLocal(new PIXI.Point(stagePoint.x, stagePoint.y));
+    return { x: local.x, y: local.y };
+  }
+
+  /** Where a hit area from the model file is right now, in the model's local coordinates; null if it has no drawable. */
+  private modelAreaRect(entry: LoadedEntry, def: HitAreaDef): LocalRect | null {
+    const internal = entry.model?.internalModel;
+    const index = internal?.getDrawableIndex?.(def.drawableId);
+    if (typeof index !== 'number' || index < 0) return null;
+    // Drawable bounds are in the model's own pixels; its local transform maps them onto the canvas.
+    const bounds = internal.getDrawableBounds(index, {});
+    const transform = internal.localTransform;
+    const a = transform.apply({ x: bounds.x, y: bounds.y });
+    const b = transform.apply({ x: bounds.x + bounds.width, y: bounds.y + bounds.height });
+    return { x: Math.min(a.x, b.x), y: Math.min(a.y, b.y), width: Math.abs(b.x - a.x), height: Math.abs(b.y - a.y) };
+  }
+
+  private customAreaRect(entry: LoadedEntry, area: CustomHitArea): LocalRect {
+    const { width, height } = modelSize(entry.model);
+    return { x: area.x * width, y: area.y * height, width: area.width * width, height: area.height * height };
+  }
+
+  /**
+   * The hit areas under a stage point that have something set to play, from
+   * the model file and the user's own. Tested in the model's local
+   * coordinates, so they follow its rotation, scale and position.
+   */
+  private hitAreasAt(entry: LoadedEntry, point: { x: number; y: number }, settings?: ModelSettings): AreaHit[] {
+    const PIXI = window.PIXI;
+    if (!PIXI || !entry.model?.internalModel) return [];
+    const modelSettings = settings ?? this.storedSettings(entry);
+    if (!modelSettings) return [];
+    const hits: AreaHit[] = [];
+    try {
+      const local = entry.model.toLocal(new PIXI.Point(point.x, point.y));
+      const consider = (name: string, rect: LocalRect | null) => {
+        const mapping = modelSettings.hit_areas?.[name];
+        if (!rect || !mapping || isEmptyMapping(mapping)) return;
+        if (local.x < rect.x || local.y < rect.y || local.x > rect.x + rect.width || local.y > rect.y + rect.height) return;
+        const existing = hits.find((hit) => hit.name === name);
+        const size = rect.width * rect.height;
+        if (existing) existing.size = Math.min(existing.size, size);
+        else hits.push({ name, mapping, size });
+      };
+      for (const area of modelSettings.custom_hit_areas ?? []) consider(area.name, this.customAreaRect(entry, area));
+      for (const def of entry.hitAreaDefs) consider(def.name, this.modelAreaRect(entry, def));
+    } catch {
+      /* model destroyed or mid-reload */
+    }
+    return hits;
+  }
+
+  /** A character's stored settings for the model on stage, without creating any (cheap enough for every frame). */
+  private storedSettings(entry: LoadedEntry): ModelSettings | undefined {
+    return this.deps.getSettings().characterModelsSettings[entry.characterId]?.[entry.modelId];
+  }
+
+  /**
+   * Let the user draw a hit area on a character's model: the next press and
+   * drag over the model's canvas gives the rectangle, in fractions of the
+   * model canvas (name left empty). `onDone` gets null if drawing is
+   * cancelled (Escape, the model leaving the stage, another drawing starting).
+   * False when the model isn't on stage.
+   */
+  startDrawing(characterId: string, onDone: (rect: CustomHitArea | null) => void): boolean {
+    this.cancelDrawing();
+    if (!this.entryFor(characterId)) return false;
+    this.drawing = { characterId, onDone, press: null };
+    this.setHovering(false);
+    return true;
+  }
+
+  cancelDrawing(): void {
+    const drawing = this.drawing;
+    if (!drawing) return;
+    this.drawing = null;
+    this.setDrawCursor(false);
+    drawing.onDone(null);
+  }
+
+  isDrawing(characterId: string): boolean {
+    return this.drawing?.characterId === characterId;
+  }
+
+  private onKeyDown(event: KeyboardEvent): void {
+    if (event.key !== 'Escape' || !this.drawing) return;
+    event.preventDefault();
+    event.stopPropagation();
+    this.cancelDrawing();
+  }
+
+  /**
+   * Whether a model's canvas is what the pointer is on at this point: no part
+   * of the app (a drawer, a modal, the chat over a background model) and no
+   * control is above it there. Other avatar canvases don't count.
+   */
+  private canvasReachableAt(entry: LoadedEntry, event: PointerEvent): boolean {
+    const target = event.target instanceof Element ? event.target : null;
+    if (target?.closest(INTERACTIVE_SELECTOR)) return false;
+    const canvas = entry.canvas;
+    const previous = canvas.style.pointerEvents;
+    canvas.style.pointerEvents = 'auto';
+    try {
+      return document.elementFromPoint(event.clientX, event.clientY) === canvas;
+    } finally {
+      canvas.style.pointerEvents = previous;
+    }
+  }
+
+  /** Whether the pointer is inside the model's canvas rectangle (turned and scaled with the model). */
+  private onModelCanvas(entry: LoadedEntry, event: PointerEvent): boolean {
+    const point = this.localPoint(entry, event);
+    const { width, height } = modelSize(entry.model);
+    return point.x >= 0 && point.y >= 0 && point.x <= width && point.y <= height;
+  }
+
+  private setDrawCursor(on: boolean): void {
+    document.documentElement.classList.toggle('live2d-avatars-drawing', on);
+  }
+
+  private startDrawingPress(event: PointerEvent): void {
+    const drawing = this.drawing!;
+    const entry = this.entryFor(drawing.characterId);
+    if (!entry) {
+      this.cancelDrawing();
+      return;
+    }
+    if (!this.canvasReachableAt(entry, event) || !this.onModelCanvas(entry, event)) return;
+    const point = this.localPoint(entry, event);
+    event.preventDefault();
+    event.stopPropagation();
+    drawing.press = { pointerId: event.pointerId, start: point, current: point };
+    this.suppressClick = true;
+  }
+
+  private finishDrawingPress(event: PointerEvent): void {
+    const drawing = this.drawing!;
+    const press = drawing.press!;
+    drawing.press = null;
+    const entry = this.entryFor(drawing.characterId);
+    if (!entry) {
+      this.cancelDrawing();
+      return;
+    }
+    press.current = this.localPoint(entry, event);
+    const { width, height } = modelSize(entry.model);
+    const clamp = (value: number) => Math.min(1, Math.max(0, value));
+    const x1 = clamp(Math.min(press.start.x, press.current.x) / width);
+    const x2 = clamp(Math.max(press.start.x, press.current.x) / width);
+    const y1 = clamp(Math.min(press.start.y, press.current.y) / height);
+    const y2 = clamp(Math.max(press.start.y, press.current.y) / height);
+    // A plain click draws nothing; keep waiting for a drag.
+    if (x2 - x1 < MIN_DRAWN_AREA || y2 - y1 < MIN_DRAWN_AREA) return;
+    this.drawing = null;
+    this.setDrawCursor(false);
+    const round = (value: number) => Math.round(value * 10000) / 10000;
+    drawing.onDone({ name: '', x: round(x1), y: round(y1), width: round(x2 - x1), height: round(y2 - y1) });
+  }
+
+  /**
+   * Outline the model's hit areas, every frame while they're shown (the
+   * model file's move with the model's animation): when the model's "Show hit
+   * areas" or the debug "Show model frames & hit areas" is on, or while an
+   * area is being drawn on it.
+   */
+  private drawAreaFrames(entry: LoadedEntry): void {
+    const PIXI = window.PIXI;
+    if (!PIXI || !this.loaded.includes(entry)) return;
+    const settings = this.storedSettings(entry);
+    const drawing = this.drawing?.characterId === entry.characterId ? this.drawing : null;
+    const show = !!settings && (settings.show_hit_areas || this.deps.getSettings().global.showFrames || drawing !== null);
+    if (!show) {
+      if (entry.areaFrames) entry.areaFrames.container.visible = false;
+      return;
+    }
+    try {
+      if (!entry.areaFrames) {
+        const container = new PIXI.Container();
+        const graphics = new PIXI.Graphics();
+        container.addChild(graphics);
+        entry.model.addChild(container);
+        entry.areaFrames = { container, graphics, labels: new Map() };
+      }
+      const frames = entry.areaFrames;
+      frames.container.visible = true;
+      const graphics = frames.graphics;
+      graphics.clear();
+      // Keep lines and labels the same size on screen whatever the model's scale.
+      const pixel = 1 / (Math.abs(entry.model.scale.x) || 1);
+      const now = performance.now();
+      const flash = entry.flash && entry.flash.until > now ? entry.flash.name : null;
+      const seen = new Set<string>();
+      const outline = (name: string, rect: LocalRect, color: number) => {
+        const mapped = !isEmptyMapping(settings.hit_areas?.[name]);
+        graphics.lineStyle(2 * pixel, color, mapped ? 1 : 0.6);
+        graphics.beginFill(color, name === flash ? 0.4 : 0.12);
+        graphics.drawRect(rect.x, rect.y, rect.width, rect.height);
+        graphics.endFill();
+        let label = frames.labels.get(name);
+        if (!label) {
+          label = new PIXI.Text(name, {
+            fontFamily: 'sans-serif',
+            fontSize: 14,
+            fill: 0xffffff,
+            stroke: 0x000000,
+            strokeThickness: 3,
+          });
+          frames.labels.set(name, label);
+          frames.container.addChild(label);
+        }
+        label.visible = true;
+        label.scale.set(pixel);
+        label.position.set(rect.x + 4 * pixel, rect.y + 2 * pixel);
+        seen.add(name);
+      };
+      for (const def of entry.hitAreaDefs) {
+        const rect = this.modelAreaRect(entry, def);
+        if (rect) outline(def.name, rect, MODEL_AREA_COLOR);
+      }
+      for (const area of settings.custom_hit_areas ?? []) outline(area.name, this.customAreaRect(entry, area), CUSTOM_AREA_COLOR);
+      const press = drawing?.press;
+      if (press) {
+        graphics.lineStyle(2 * pixel, DRAWING_AREA_COLOR, 1);
+        graphics.beginFill(DRAWING_AREA_COLOR, 0.2);
+        graphics.drawRect(
+          Math.min(press.start.x, press.current.x),
+          Math.min(press.start.y, press.current.y),
+          Math.abs(press.current.x - press.start.x),
+          Math.abs(press.current.y - press.start.y),
+        );
+        graphics.endFill();
+      }
+      for (const [name, label] of frames.labels) {
+        if (seen.has(name)) continue;
+        frames.container.removeChild(label);
+        label.destroy();
+        frames.labels.delete(name);
+      }
+    } catch {
+      /* model destroyed or mid-reload */
+    }
   }
 
   private tick(): void {
@@ -1189,10 +1502,9 @@ export class Stage {
       foreground.width = entry.model.internalModel.width;
       foreground.height = entry.model.internalModel.height;
       foreground.alpha = 0.2;
-      const hitFrames = new PIXI.live2d.HitAreaFrames();
-      entry.model.addChild(foreground);
-      entry.model.addChild(hitFrames);
-      entry.frames = [foreground, hitFrames];
+      // The hit areas are outlined by drawAreaFrames.
+      entry.model.addChildAt(foreground, entry.clip ? 1 : 0);
+      entry.frames = [foreground];
     } catch (error) {
       this.deps.log(`Show frames failed: ${String(error)}`);
     }
@@ -1202,6 +1514,7 @@ export class Stage {
 
   private teardownApp(): void {
     this.loadToken++;
+    this.cancelDrawing();
     // A press that started on a model won't get its pointerup handled now,
     // so don't leave the next click anywhere swallowed.
     if (this.drag) this.suppressClick = false;

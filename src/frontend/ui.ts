@@ -6,11 +6,13 @@
  */
 
 import type { SpindleSelectHandle, SpindleSelectOptionLeading, SpindleSelectOptions } from 'lumiverse-spindle-types';
+import { applyTapMotions, suggestAreaMotion } from './hit-areas';
 import type { ModelDescription, Stage } from './stage';
 import {
   CLASSIFY_EXPRESSIONS,
   CURSOR_PARAM_IDS,
   type LibrarySort,
+  type CustomHitArea,
   type LibraryView,
   type Live2DSettings,
   type ModelRecord,
@@ -278,6 +280,8 @@ export class SettingsUI {
   private mounted: SpindleSelectHandle[] = [];
   /** Host dropdowns to mount once the render has put their placeholders in the tab. */
   private pendingMounts: Array<() => void> = [];
+  /** Whether Model settings' Hit areas section is open, kept across renders. */
+  private hitAreasOpen = false;
 
   constructor(private controller: UIController) {}
 
@@ -969,42 +973,212 @@ export class SettingsUI {
     host.appendChild(classifySection);
 
     // Hit areas
-    const hitAreaNames = new Set([...description.hitAreas, ...Object.keys(modelSettings.hit_areas)]);
-    if (hitAreaNames.size > 0) {
-      const hitAreas = el('div');
-      for (const area of hitAreaNames) {
-        if (!modelSettings.hit_areas[area]) {
-          modelSettings.hit_areas[area] = { expression: 'none', motion: 'none', message: '' };
-        }
-        const mapping = modelSettings.hit_areas[area]!;
-        const message = el('input', 'l2d-input') as HTMLInputElement;
-        message.type = 'text';
-        message.placeholder = 'Message';
-        message.value = mapping.message;
-        message.addEventListener('change', () => {
-          mapping.message = message.value;
-          controller.saveDebounced();
-        });
-        hitAreas.appendChild(
-          row(
-            el('span', 'l2d-emotion', area),
-            select(expressionOptions(description), mapping.expression, (value) => {
-              mapping.expression = value;
-              controller.saveDebounced();
-            }),
-            select(motionOptions(description), mapping.motion, (value) => {
-              mapping.motion = value;
-              controller.saveDebounced();
-            }),
-            message,
-            button('▶', () => play(mapping)),
-          ),
-        );
+    const hitSection = section('Hit areas');
+    hitSection.classList.add('l2d-hit-areas');
+    const hitDetails = hitSection as HTMLDetailsElement;
+    hitDetails.open = this.hitAreasOpen;
+    hitDetails.addEventListener('toggle', () => {
+      this.hitAreasOpen = hitDetails.open;
+    });
+    const hitBody = el('div');
+    hitSection.appendChild(hitBody);
+    this.renderHitAreas(hitBody, characterId, modelId, description, modelSettings);
+    host.appendChild(hitSection);
+  }
+
+  /**
+   * What a tap on each hit area plays: the model file's areas, and areas the
+   * user draws on the model themselves (most models from games define none).
+   */
+  private renderHitAreas(
+    host: HTMLElement,
+    characterId: string,
+    modelId: string,
+    description: ModelDescription,
+    modelSettings: ModelSettings,
+  ): void {
+    const controller = this.controller;
+    const stage = controller.stage;
+    const rerender = () => {
+      host.replaceChildren();
+      this.renderHitAreas(host, characterId, modelId, description, modelSettings);
+    };
+    const play = (mapping: { expression: string; motion: string }) => {
+      void stage.playExpression(characterId, mapping.expression);
+      void stage.playMotion(characterId, mapping.motion, true);
+    };
+    const modelAreas = description.hitAreas;
+    const custom = modelSettings.custom_hit_areas;
+    const taken = (name: string) => modelAreas.includes(name) || custom.some((area) => area.name === name);
+    const hint = el('span', 'l2d-dim', '');
+
+    host.appendChild(
+      checkbox('Show hit areas on the model', modelSettings.show_hit_areas, (value) => {
+        modelSettings.show_hit_areas = value;
+        controller.saveDebounced();
+      }),
+    );
+    host.appendChild(
+      note(
+        'Tap a hit area on the model to play what it’s set to. Where areas overlap, the smallest one wins; ' +
+          'a tap anywhere else on the model plays the “On click” animation.',
+      ),
+    );
+
+    const mappingControls = (area: string) => {
+      const mapping = (modelSettings.hit_areas[area] ??= { expression: 'none', motion: 'none', message: '' });
+      const message = el('input', 'l2d-input') as HTMLInputElement;
+      message.type = 'text';
+      message.placeholder = 'Message';
+      message.title = 'Message sent to the chat when this area is tapped (optional)';
+      message.value = mapping.message;
+      message.addEventListener('change', () => {
+        mapping.message = message.value;
+        controller.saveDebounced();
+      });
+      const expression = select(expressionOptions(description), mapping.expression, (value) => {
+        mapping.expression = value;
+        controller.saveDebounced();
+      });
+      expression.title = 'Expression';
+      const motion = select(motionOptions(description), mapping.motion, (value) => {
+        mapping.motion = value;
+        controller.saveDebounced();
+      });
+      motion.title = 'Motion';
+      const test = button('▶', () => play(mapping));
+      test.title = 'Play';
+      return [expression, motion, message, test];
+    };
+
+    /** Let the user drag out an area on the model; `done` gets the rectangle (fractions of the model canvas). */
+    const draw = (name: string, done: (rect: CustomHitArea) => void) => {
+      const drawingHint = `Drag on the model to draw “${name}”. Esc cancels.`;
+      if (!stage.isOnStage(characterId, modelId)) {
+        hint.textContent = 'Show the model first, then try again.';
+        return;
       }
-      const hitSection = section('Hit areas', hitAreas);
-      (hitSection as HTMLDetailsElement).open = false;
-      host.appendChild(hitSection);
+      let watch = 0;
+      let cancel: HTMLButtonElement | null = null;
+      const started = stage.startDrawing(characterId, (rect) => {
+        window.clearInterval(watch);
+        cancel?.remove();
+        if (!rect) {
+          if (hint.textContent === drawingHint) hint.textContent = 'Drawing cancelled.';
+          return;
+        }
+        done(rect);
+      });
+      if (!started) {
+        hint.textContent = 'Show the model first, then try again.';
+        return;
+      }
+      hint.textContent = drawingHint;
+      cancel = button('Cancel', () => stage.cancelDrawing());
+      hint.after(cancel);
+      // Stop drawing once this tab is closed, so a later tap on the model isn't taken for a drawing.
+      watch = window.setInterval(() => {
+        if (!hint.isConnected || hint.offsetParent === null) stage.cancelDrawing();
+      }, 500);
+    };
+
+    if (modelAreas.length > 0) {
+      host.appendChild(el('div', 'l2d-anim-title', 'From the model file'));
+      for (const area of modelAreas) {
+        host.appendChild(row(el('span', 'l2d-emotion', area), ...mappingControls(area)));
+      }
+    } else {
+      host.appendChild(note('This model’s file defines no hit areas. Draw your own below.'));
     }
+
+    if (custom.length > 0) host.appendChild(el('div', 'l2d-anim-title', 'Drawn on the model'));
+    for (const area of custom) {
+      const name = el('input', 'l2d-input l2d-area-name') as HTMLInputElement;
+      name.type = 'text';
+      name.value = area.name;
+      name.title = 'Area name';
+      name.addEventListener('change', () => {
+        const next = name.value.trim().slice(0, 64);
+        if (next === area.name) return;
+        if (!next || taken(next)) {
+          hint.textContent = next ? `There’s already an area called “${next}”.` : 'An area needs a name.';
+          name.value = area.name;
+          return;
+        }
+        const mapping = modelSettings.hit_areas[area.name];
+        if (!modelAreas.includes(area.name)) delete modelSettings.hit_areas[area.name];
+        if (mapping) modelSettings.hit_areas[next] = mapping;
+        area.name = next;
+        controller.saveDebounced();
+        rerender();
+      });
+      const redraw = button('Redraw', () =>
+        draw(area.name, (rect) => {
+          Object.assign(area, { x: rect.x, y: rect.y, width: rect.width, height: rect.height });
+          controller.saveDebounced();
+          hint.textContent = `Redrew “${area.name}”.`;
+        }),
+      );
+      redraw.title = 'Drag a new rectangle for this area on the model';
+      const remove = button('✕', () => {
+        const index = custom.indexOf(area);
+        if (index !== -1) custom.splice(index, 1);
+        if (!modelAreas.includes(area.name)) delete modelSettings.hit_areas[area.name];
+        controller.saveDebounced();
+        rerender();
+      });
+      remove.title = `Delete ${area.name}`;
+      remove.setAttribute('aria-label', `Delete ${area.name}`);
+      host.appendChild(row(name, ...mappingControls(area.name), redraw, remove));
+    }
+
+    const newName = el('input', 'l2d-input l2d-area-name') as HTMLInputElement;
+    newName.type = 'text';
+    newName.placeholder = 'New area, e.g. Head';
+    const add = button('Add area', () => {
+      const name = newName.value.trim().slice(0, 64);
+      if (!name) {
+        hint.textContent = 'Name the area first.';
+        return;
+      }
+      if (taken(name)) {
+        hint.textContent = `There’s already an area called “${name}”.`;
+        return;
+      }
+      draw(name, (rect) => {
+        if (taken(name)) return;
+        custom.push({ ...rect, name });
+        const mapping = modelSettings.hit_areas[name];
+        if (!mapping || (mapping.expression === 'none' && mapping.motion === 'none' && !mapping.message)) {
+          modelSettings.hit_areas[name] = {
+            expression: 'none',
+            motion: suggestAreaMotion(name, description.motions),
+            message: mapping?.message ?? '',
+          };
+        }
+        // Show what was drawn.
+        modelSettings.show_hit_areas = true;
+        controller.saveDebounced();
+        rerender();
+      });
+    });
+    add.title = 'Name the area, then drag a rectangle over that part of the model';
+    newName.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') add.click();
+    });
+    const suggest = button('Use the model’s tap motions', () => {
+      const names = [...modelAreas, ...custom.map((area) => area.name)];
+      const count = applyTapMotions(modelSettings, names, description.motions);
+      if (count === 0) {
+        hint.textContent = 'No tap motions to add: the model has none named for these areas, or they’re already set.';
+        return;
+      }
+      controller.saveDebounced();
+      rerender();
+    });
+    suggest.title = 'Set areas (and “On click”) that play nothing yet to the model’s motion groups named for tapping them, like “Tap”, “TapHead” or “touch_body”';
+    host.appendChild(row(newName, add, suggest));
+    host.appendChild(row(hint));
   }
 
   private animationRow(
@@ -1065,6 +1239,7 @@ export const UI_CSS = `
 .l2d-slider-head { display: flex; justify-content: space-between; color: var(--lumiverse-text-muted); }
 .l2d-slider-value { color: var(--lumiverse-text); }
 .l2d-emotion { min-width: 110px; color: var(--lumiverse-text-muted); }
+.l2d-input.l2d-area-name { flex: 0 1 110px; min-width: 80px; }
 .l2d-model-name { font-weight: 600; }
 .l2d-anim { border-top: 1px solid var(--lumiverse-border); padding-top: 6px; margin-top: 6px; }
 .l2d-anim-title { font-weight: 600; color: var(--lumiverse-text-muted); }
