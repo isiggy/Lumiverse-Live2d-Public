@@ -19,6 +19,9 @@
 //                                 # and both extensions share the columns and the stacking order
 //                                 # (Send to front / Send to back, which model gets the pointer)
 //   lumiverse.sh e2e --group --stack --spine-model …  # only the stacking checks of a mixed group
+//   lumiverse.sh e2e --hit-areas  # then draw a hit area on the model's face in Model settings, and
+//                                 # check taps on it play its motion (upright, rotated, after a reload)
+//                                 # while taps elsewhere fall back to On click
 //   (--model and --slow are handled by lumiverse.sh)
 
 import { createRequire } from 'node:module';
@@ -33,6 +36,7 @@ const keepOpen = process.argv.includes('--keep-open');
 const testLibrary = process.argv.includes('--library');
 const group = process.argv.includes('--group');
 const stackOnly = process.argv.includes('--stack');
+const testHitAreas = process.argv.includes('--hit-areas');
 const lines = (value) => (value || '').split('\n').filter(Boolean);
 const MODEL_ZIPS = lines(process.env.LUMI_MODEL_ZIPS || process.env.LUMI_MODEL_ZIP);
 const SPINE_ZIPS = lines(process.env.LUMI_SPINE_ZIPS);
@@ -771,6 +775,27 @@ async function runGroup() {
   if (mixed) await checkStacking(members, owners);
   if (stackOnly) return;
 
+  // A tap on a member's model goes to that model's canvas only.
+  const tappedCanvases = [];
+  for (const [index, owner] of owners.entries()) {
+    const box = before[owner]?.columns[index]?.box;
+    if (owner !== 'live2d' || !box) continue;
+    const counts = () =>
+      page.evaluate(() =>
+        [...document.querySelectorAll('.live2d-avatars-canvas')].map((canvas) => Number(canvas.dataset.live2dTaps ?? 0)),
+      );
+    const was = await counts();
+    await page.mouse.click(center(box), box.y + box.height * 0.4);
+    await page.waitForTimeout(300);
+    const now = await counts();
+    const tapped = now.flatMap((count, canvas) => (count > (was[canvas] ?? 0) ? [canvas] : []));
+    check(
+      tapped.length === 1 && !tappedCanvases.includes(tapped[0]),
+      `a tap on member ${index + 1}'s model reaches its canvas only (canvases tapped: ${JSON.stringify(tapped)})`,
+    );
+    tappedCanvases.push(...tapped);
+  }
+
   // Dragging the first member's model moves only it.
   const first = before.live2d.columns[0].box;
   const second = before[owners[1]].columns[1].box;
@@ -864,6 +889,151 @@ async function runGroup() {
   }
 }
 
+/** The Hit areas section of Model settings, opened. */
+async function openHitAreas() {
+  await openLive2DTab();
+  const hitAreas = page.locator('details.l2d-hit-areas');
+  await hitAreas.waitFor({ timeout: 60000 });
+  await hitAreas.evaluate((node) => (node.open = true));
+  return hitAreas;
+}
+
+/** Tap (press and release) at a viewport point; returns what the model's canvas says the tap hit, or null for no tap. */
+async function tapAt(x, y, screenshot) {
+  const taps = () =>
+    page.evaluate(() => {
+      const canvas = document.querySelector('.live2d-avatars-canvas');
+      return { count: Number(canvas?.dataset.live2dTaps ?? 0), area: canvas?.dataset.live2dTap ?? null };
+    });
+  const before = await taps();
+  await page.mouse.move(x, y);
+  await page.mouse.down();
+  await page.mouse.up();
+  // While hit areas are shown, the tapped one is highlighted for a moment.
+  if (screenshot) await page.waitForTimeout(80).then(() => page.screenshot({ path: screenshot }));
+  else await page.waitForTimeout(300);
+  const after = await taps();
+  return after.count > before.count ? after.area : null;
+}
+
+async function reopenChat() {
+  await page.goto(CHAT);
+  await page.waitForSelector('.live2d-avatars-canvas', { timeout: 180000 });
+  await page.waitForTimeout(5000);
+}
+
+/** Where the model's canvas center is on screen (the model's center at X/Y offset 0, solo chat). */
+async function stageCenter() {
+  return page.evaluate(() => {
+    const rect = document.querySelector('.live2d-avatars-canvas').getBoundingClientRect();
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  });
+}
+
+async function hitAreaTest(freshBinding) {
+  console.log('Hit areas:');
+  let section = await openHitAreas();
+  const text = await section.innerText();
+  // The model file's areas are the rows before "Drawn on the model" that have no name field.
+  const fileAreas = await section
+    .locator('.l2d-row:has(> span.l2d-emotion)')
+    .evaluateAll((rows) => rows.map((row) => row.querySelector('span.l2d-emotion').textContent));
+  if (fileAreas.length === 0) {
+    check(text.includes('defines no hit areas'), 'a model without hit areas says so and offers drawing them');
+  } else {
+    console.log(`Hit areas from the model file: ${fileAreas.join(', ')}`);
+    // Give every file area a motion, so a tap on the model's body lands on one.
+    for (const area of fileAreas) {
+      const motion = section.locator(`.l2d-row:has(> span.l2d-emotion:text-is("${area}")) select`).nth(1);
+      if ((await motion.inputValue()) === 'none') {
+        await motion.selectOption({ index: 1 });
+        console.log(`  ${area}: set to ${await motion.inputValue()}`);
+      } else {
+        console.log(`  ${area}: ${await motion.inputValue()} (already set)`);
+      }
+    }
+  }
+  if (freshBinding && fileAreas.length === 0) {
+    // haru_ja has a "Tap" motion group: a new binding plays it on click.
+    const onClick = await page.evaluate(() => {
+      const title = [...document.querySelectorAll('.l2d-anim-title')].find((node) => node.textContent === 'On click');
+      return title?.parentElement?.querySelectorAll('select')[1]?.value ?? null;
+    });
+    check(onClick === 'Tap_id=random', `a new binding's On click uses the model's tap motion (${onClick})`);
+  }
+  const center = await stageCenter();
+  // A small box on the face (for the test models, upright at scale 1), smaller than any head area
+  // the model file has, so a tap in it hits this one.
+  const head = { x1: center.x - 40, y1: center.y - 310, x2: center.x + 40, y2: center.y - 230 };
+  const headCenter = { x: center.x, y: (head.y1 + head.y2) / 2 };
+
+  // Start without drawn areas (left from an earlier run).
+  while ((await section.locator('button[aria-label^="Delete "]').count()) > 0) {
+    await section.locator('button[aria-label^="Delete "]').first().click();
+    await page.waitForTimeout(300);
+    section = await openHitAreas();
+  }
+  await section.locator('input[placeholder="New area, e.g. Head"]').fill('Face');
+  await section.locator('button:text-is("Add area")').click();
+  check((await section.innerText()).includes('Drag on the model to draw “Face”'), 'Add area asks to drag on the model');
+  await page.screenshot({ path: `${OUT}/hit-1-drawing.png` });
+  await page.mouse.move(head.x1, head.y1);
+  await page.mouse.down();
+  await page.mouse.move((head.x1 + head.x2) / 2, (head.y1 + head.y2) / 2, { steps: 5 });
+  await page.mouse.move(head.x2, head.y2, { steps: 5 });
+  await page.screenshot({ path: `${OUT}/hit-2-dragging.png` });
+  await page.mouse.up();
+  await page.waitForTimeout(500);
+  section = await openHitAreas();
+  const nameInputs = await section.locator('input.l2d-area-name:not([placeholder])').evaluateAll((nodes) => nodes.map((node) => node.value));
+  check(nameInputs.includes('Face'), `the drawn area is listed (${JSON.stringify(nameInputs)})`);
+  check(
+    await section.locator('label:has-text("Show hit areas on the model") input').isChecked(),
+    'drawing an area turns on Show hit areas',
+  );
+  // Give it a motion: the last one in the list, unlike On click's.
+  const headMotion = section.locator('.l2d-row:has(input.l2d-area-name)').first().locator('select').nth(1);
+  const motionCount = await headMotion.locator('option').count();
+  await headMotion.selectOption({ index: motionCount - 1 });
+  const chosenMotion = await headMotion.inputValue();
+  await page.waitForTimeout(1000);
+  await page.screenshot({ path: `${OUT}/hit-3-area-in-settings.png` });
+
+  // Reopen the chat to close the drawer, so the whole stage shows.
+  await reopenChat();
+  check(
+    (await tapAt(headCenter.x, headCenter.y, `${OUT}/hit-4-tap-head.png`)) === 'Face',
+    'a tap on the face hits the drawn area',
+  );
+  const bodyTap = await tapAt(center.x, center.y + 50, fileAreas.length ? `${OUT}/hit-4b-tap-body.png` : undefined);
+  if (fileAreas.length === 0) check(bodyTap === '', 'a tap on the body plays On click');
+  else check(fileAreas.includes(bodyTap), `a tap on the body hits one of the model file's areas (${bodyTap})`);
+  check((await tapAt(center.x - 500, center.y)) === null, 'a tap beside the model is not a tap on it');
+
+  // Rotated 90° counterclockwise about the model's center, the head is to the left of it.
+  await openLive2DTab();
+  await setSlider('Rotation (°)', -90);
+  await page.waitForTimeout(1000);
+  await reopenChat();
+  const turned = { x: center.x - (center.y - headCenter.y), y: center.y };
+  check(
+    (await tapAt(turned.x, turned.y, `${OUT}/hit-5-rotated.png`)) === 'Face',
+    'rotated -90°, a tap where the head went hits the area',
+  );
+  check((await tapAt(headCenter.x, headCenter.y)) !== 'Face', 'rotated -90°, the old head position is not the area');
+  await openLive2DTab();
+  await setSlider('Rotation (°)', 0);
+  await page.waitForTimeout(1000);
+
+  // Saved: still there after a reload.
+  await reopenChat();
+  check((await tapAt(headCenter.x, headCenter.y)) === 'Face', 'after a reload the area is still there');
+  section = await openHitAreas();
+  const motion = await section.locator('.l2d-row:has(input.l2d-area-name)').first().locator('select').nth(1).inputValue();
+  check(motion === chosenMotion, `after a reload the area keeps its motion (${motion})`);
+  await page.keyboard.press('Escape');
+}
+
 try {
   await page.goto(BASE);
   await page.fill('input[type="text"]', process.env.LUMI_USER);
@@ -933,6 +1103,7 @@ try {
     console.log('OK: avatar overlay is on screen');
   }
   if (testLibrary && stage) await libraryTest();
+  if (testHitAreas && stage) await hitAreaTest(binding.startsWith('bound'));
 } finally {
   await browser.close();
 }
