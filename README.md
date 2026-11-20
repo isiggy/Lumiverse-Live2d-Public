@@ -12,7 +12,7 @@ Supports **Cubism 2.1** (`*.model.json`) and **Cubism 3/4/5** (`*.model3.json`) 
 - **Settings files** — *Export settings* saves a character's model and animation settings for its model to a `.json` file; *Import settings* loads one onto the selected character, binding it to the file's model (found by id, then name). The file format is shared with the Spine Avatars extension, which refuses Live2D files and vice versa.
 - **Emotion-driven animation** — new character messages are classified into one of the classic 28 emotions (`joy`, `anger`, `surprise`, …) with a quiet LLM generation, and each emotion can be mapped to a model expression and/or motion. Alternatively reuse Lumiverse's own expression detection (`EXPRESSION_CHANGED`) or turn it off.
 - **Talking mouth animation** — the mouth-open parameter is animated while the character "speaks", scaled by message length (configurable speed and per-character duration; parameter auto-detected with the same fallbacks as the ST extension).
-- **Hit areas & interactions** — click the model to trigger mapped expressions/motions per hit area (priority-ordered like the ST extension), optionally sending a message into the chat and auto-triggering a reply ("Auto-send interaction").
+- **Hit areas & interactions** — tap a part of the model (head, body…) to play an expression or motion set for that hit area, optionally sending a message into the chat and auto-triggering a reply ("Auto-send interaction"). Uses the hit areas the model file defines, plus any you draw on the model yourself, per model; new models play their own tap motions (`Tap`, `TapHead`, `touch_body`…) out of the box.
 - **Cursor following** — the model's head/eyes/body follow your cursor, with per-model parameter overrides (`ParamAngleX/Y/Z`, `ParamBodyAngleX`, `ParamBreath`, `ParamEyeBallX/Y`) and automatic detection of legacy parameter names.
 - **Layout controls** — scale / X / Y / rotation sliders, plus drag-and-drop positioning (positions persist as percent offsets, same formula as the ST extension). Eye-follow offset slider included. Anything a model draws outside its own canvas (full-scene models often carry oversized backdrop art) is hidden by default, so a zoomed-out model ends at its canvas edge; a per-model checkbox turns that off.
 - **Background mode** — a global toggle that draws the model behind the chat instead of over it, so messages and the input bar sit on top of it like a wallpaper. Needs `app_manipulation`. While it's on, the chat takes the clicks, so drag and hit areas don't respond; the model is drawn over any wallpaper or scene background, so their opacity setting only fades the wallpaper.
@@ -58,7 +58,14 @@ Under *Emotion mappings*, pick an expression and/or motion for each of the 28 cl
 
 ### Hit areas
 
-Models that define hit areas get a row per area under *Hit areas*: expression, motion, and an optional message. Clicking the model picks the highest-priority mapped area under the cursor (or the *On click* defaults). If a message is set, it is sent as you; with *Auto-send interaction* enabled the character replies immediately.
+Under *Model settings > Hit areas*, every hit area gets a row: expression, motion, an optional message, and ▶ to preview it. Tapping the model (pressing and releasing without dragging) plays the row of the area under the pointer; where areas overlap, such as a head inside a body, the smallest one wins, and a tap anywhere else on the model plays *On click*. If a message is set, it is sent as you; with *Auto-send interaction* enabled the character replies immediately.
+
+- **From the model file**: the `HitAreas` of a model3.json (or `hit_areas` of a Cubism 2 model.json). An area with an empty name is listed by its Id.
+- **Drawn on the model**: many models, especially ones taken from games, define no hit areas. Type a name, press *Add area*, and drag a rectangle over that part of the model. The rectangle belongs to the model's canvas, so it follows the model when you move, zoom or rotate it. Rename an area in its name field, *Redraw* it, or delete it with ✕.
+- **Show hit areas on the model** outlines them (blue from the model file, orange drawn by you) and briefly highlights the one you tap.
+- **Use the model's tap motions** fills areas that play nothing yet with the model's motion groups named for them (`Tap@Head`, `TapHead`, `tap_head`, `touch_head` for an area called *Head*), and *On click* with a `Tap`, `touch` or `TapBody` group. A newly bound model gets this automatically.
+
+Hit areas also catch taps where the model's art is transparent (around the hair, say), as long as they have something to play. In background mode the chat takes the clicks, as noted above.
 
 ## How it works
 
