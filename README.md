@@ -15,7 +15,7 @@ Supports **Cubism 2.1** (`*.model.json`) and **Cubism 3/4/5** (`*.model3.json`) 
 - **Hit areas & interactions** — tap a part of the model (head, body…) to play an expression or motion set for that hit area, optionally sending a message into the chat and auto-triggering a reply ("Reply to click messages"). Uses the hit areas the model file defines, plus any you draw on the model yourself, per model; new models play their own tap motions (`Tap`, `TapHead`, `touch_body`…) out of the box.
 - **Cursor following** — the model's head/eyes/body follow your cursor, with per-model parameter overrides (`ParamAngleX/Y/Z`, `ParamBodyAngleX`, `ParamBreath`, `ParamEyeBallX/Y`) and automatic detection of legacy parameter names.
 - **Layout controls** — zoom / X / Y / rotation sliders (type an exact value next to each, or ↺ to reset it), plus drag-and-drop positioning (positions persist as percent offsets, same formula as the ST extension). Anything a model draws outside its own canvas (full-scene models often carry oversized backdrop art) is hidden by default, so a zoomed-out model ends at its canvas edge; a per-model checkbox turns that off.
-- **Background mode** — a global toggle that draws the model behind the chat instead of over it, so messages and the input bar sit on top of it like a wallpaper. Needs `app_manipulation`. While it's on, the chat takes the clicks, so drag and hit areas don't respond; the model is drawn over any wallpaper or scene background, so their opacity setting only fades the wallpaper.
+- **Background mode** — a global toggle that draws the model behind the chat instead of over it, so messages and the input bar sit on top of it like a wallpaper. Needs `app_manipulation`. Taps still reach the model wherever the chat leaves it showing (the empty space around and between messages) and play its hit areas and *On click*; a press that moves, is held, or selects text stays the chat's, so scrolling and selecting work as usual. Messages, the input bar and buttons keep their own clicks, and the model can't be dragged through the chat. The model is drawn over any wallpaper or scene background, so their opacity setting only fades the wallpaper.
 - **Chat-open / default / click animations** — play an animation when a chat opens (with delay), fall back to a default animation when an emotion has no mapping (or loop it, so its motion plays whenever nothing else does and its expression returns after others), and configure the default click behavior.
 - **Debug tools** — show model frame & hit areas, force animation (reset model before each motion, for models without a stable idle state), force animation looping, and a reload button.
 - **ST settings presets** — if a model folder ships a `sillytavern_settings.json`, it is applied automatically the first time the model is used.
@@ -57,6 +57,8 @@ The extension works with whatever you grant and degrades gracefully:
 
 Under *Emotion mappings*, pick an expression and/or motion for each of the 28 classify labels. When a mapping is `none`, the *Default* animation plays instead. Use the ▶ buttons to preview any mapping on the live model, and *Test emotion classification* to see what label a given text produces.
 
+An emotion's motion can also be one of the model's taps, listed under *Taps* in the motion dropdown: a hit area (*Tap Head*) or *On click*. It then plays what that tap is set to under *Hit areas*: its motion, and its expression unless the emotion sets its own. The tap's message isn't sent.
+
 ### Hit areas
 
 Under *Model settings > Hit areas*, every hit area gets a row: expression, motion, an optional message, and ▶ to preview it. Tapping the model (pressing and releasing without dragging) plays the row of the area under the pointer; where areas overlap, such as a head inside a body, the smallest one wins, and a tap anywhere else on the model plays *On click*. If a message is set, it is sent as you; with *Reply to click messages* on the character replies immediately.
@@ -67,7 +69,7 @@ Under *Model settings > Hit areas*, every hit area gets a row: expression, motio
 - **Show hit areas on the model** outlines them (blue from the model file, orange drawn by you) and briefly highlights the one you tap.
 - **Use the model's tap motions** fills areas that play nothing yet with the model's motion groups named for them (`Tap@Head`, `TapHead`, `tap_head`, `touch_head` for an area called *Head*), and *On click* with a `Tap`, `touch` or `TapBody` group. A newly bound model gets this automatically.
 
-Hit areas also catch taps where the model's art is transparent (around the hair, say), as long as they have something to play. In background mode the chat takes the clicks, as noted above.
+Hit areas also catch taps where the model's art is transparent (around the hair, say), as long as they have something to play. In background mode they work through the empty parts of the chat, as noted above.
 
 ## How it works
 

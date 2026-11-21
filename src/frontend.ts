@@ -31,6 +31,7 @@ const STAGE_CSS = `
 .live2d-avatars-overlay { position: fixed; inset: 0; pointer-events: none; z-index: 4; }
 .live2d-avatars-canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; background: transparent; }
 html.live2d-avatars-hover, html.live2d-avatars-hover * { cursor: grab !important; }
+html.live2d-avatars-tap, html.live2d-avatars-tap * { cursor: pointer !important; }
 html.live2d-avatars-drawing, html.live2d-avatars-drawing * { cursor: crosshair !important; }
 `;
 
@@ -409,7 +410,11 @@ export function setup(ctx: SpindleFrontendContext) {
     const modelId = settings.characterModelMapping[characterId];
     if (!modelId) return;
     const modelSettings = getOrCreateModelSettings(characterId, modelId, stage.getDescription(characterId));
-    const mapping = modelSettings.classify_mapping[msg.label] ?? { expression: 'none', motion: 'none' };
+    // An emotion can be set to play one of the model's taps (Model settings > Emotion mappings).
+    const mapping = stage.expandTap(
+      characterId,
+      modelSettings.classify_mapping[msg.label] ?? { expression: 'none', motion: 'none' },
+    );
     let expression = mapping.expression;
     let motion = mapping.motion;
     if (expression === 'none') expression = modelSettings.animation_default.expression;
