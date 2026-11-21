@@ -8,6 +8,7 @@
 import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
 import { ModelAssets } from './frontend/assets';
 import { placeAvatarLayers } from './frontend/columns';
+import { applyTapMotions } from './frontend/hit-areas';
 import { Stage, type ModelDescription } from './frontend/stage';
 import { SettingsUI, UI_CSS, type UIController } from './frontend/ui';
 import { tusUpload } from './frontend/tus';
@@ -30,6 +31,7 @@ const STAGE_CSS = `
 .live2d-avatars-overlay { position: fixed; inset: 0; pointer-events: none; z-index: 4; }
 .live2d-avatars-canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; background: transparent; }
 html.live2d-avatars-hover, html.live2d-avatars-hover * { cursor: grab !important; }
+html.live2d-avatars-drawing, html.live2d-avatars-drawing * { cursor: crosshair !important; }
 `;
 
 const TAB_ICON =
@@ -86,10 +88,10 @@ export function setup(ctx: SpindleFrontendContext) {
     const byCharacter = (settings.characterModelsSettings[characterId] ??= {});
     let modelSettings = byCharacter[modelId];
     if (!modelSettings) {
-      modelSettings =
-        preset !== undefined && preset !== null
-          ? normalizeModelSettings(preset, description?.hitAreas ?? [])
-          : normalizeModelSettings(null, description?.hitAreas ?? []);
+      const hasPreset = preset !== undefined && preset !== null;
+      modelSettings = normalizeModelSettings(hasPreset ? preset : null, description?.hitAreas ?? []);
+      // A new model reacts to taps with its own tap motions, where it has any.
+      if (!hasPreset && description) applyTapMotions(modelSettings, description.hitAreas, description.motions);
       byCharacter[modelId] = modelSettings;
       saveDebounced();
     } else {
