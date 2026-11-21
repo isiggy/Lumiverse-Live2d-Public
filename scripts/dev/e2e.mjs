@@ -37,6 +37,8 @@ const testLibrary = process.argv.includes('--library');
 const group = process.argv.includes('--group');
 const stackOnly = process.argv.includes('--stack');
 const testHitAreas = process.argv.includes('--hit-areas');
+// How long a model may take to appear: big models under swiftshader can take many minutes.
+const LOAD_TIMEOUT = Number(process.env.LUMI_LOAD_TIMEOUT_MS) || 180000;
 const lines = (value) => (value || '').split('\n').filter(Boolean);
 const MODEL_ZIPS = lines(process.env.LUMI_MODEL_ZIPS || process.env.LUMI_MODEL_ZIP);
 const SPINE_ZIPS = lines(process.env.LUMI_SPINE_ZIPS);
@@ -918,7 +920,7 @@ async function tapAt(x, y, screenshot) {
 
 async function reopenChat() {
   await page.goto(CHAT);
-  await page.waitForSelector('.live2d-avatars-canvas', { timeout: 180000 });
+  await page.waitForSelector('.live2d-avatars-canvas', { timeout: LOAD_TIMEOUT });
   await page.waitForTimeout(5000);
 }
 
@@ -1074,7 +1076,7 @@ try {
   const loadStart = Date.now();
   // Large models take a while to download, especially with --slow.
   const appeared = await page
-    .waitForSelector('.live2d-avatars-canvas', { timeout: 180000 })
+    .waitForSelector('.live2d-avatars-canvas', { timeout: LOAD_TIMEOUT })
     .then(() => true, () => false);
   if (appeared) console.log(`Model loaded ${((Date.now() - loadStart) / 1000).toFixed(1)}s after opening the chat`);
   await page.waitForTimeout(4000);

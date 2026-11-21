@@ -28,7 +28,7 @@ import {
   sameColumns,
   sameStack,
 } from './columns';
-import { type HitAreaDef, hitAreaDefsFromBundle } from './hit-areas';
+import { type HitAreaDef, detectHitAreaMeshes, hitAreaDefsFromBundle } from './hit-areas';
 import { ensureLive2DRuntime } from './runtime';
 import { squareThumbnail, THUMBNAIL_RENDER_PIXELS } from './thumbnail';
 import {
@@ -86,6 +86,8 @@ export interface ModelDescription {
   /** motion group -> per-motion file names */
   motions: Record<string, string[]>;
   hitAreas: string[];
+  /** The hit areas were found among the model's art meshes by name, as its file lists none (known once instantiated). */
+  hitAreasDetected?: boolean;
   parameterIds: string[];
   /** The model's canvas size in model units, known once it has been instantiated. */
   size?: { width: number; height: number };
@@ -219,6 +221,55 @@ function modelSize(model: any): { width: number; height: number } {
   return {
     width: model.internalModel?.width || 1,
     height: model.internalModel?.height || model.height || 1,
+  };
+}
+
+/** Where a drawable (art mesh) is right now, in a model's local coordinates; null if the model has no such drawable. */
+function drawableRect(model: any, drawableId: string): LocalRect | null {
+  const internal = model?.internalModel;
+  const index = internal?.getDrawableIndex?.(drawableId);
+  if (typeof index !== 'number' || index < 0) return null;
+  // Drawable bounds are in the model's own pixels; its local transform maps them onto the canvas.
+  const bounds = internal.getDrawableBounds(index, {});
+  const transform = internal.localTransform;
+  const a = transform.apply({ x: bounds.x, y: bounds.y });
+  const b = transform.apply({ x: bounds.x + bounds.width, y: bounds.y + bounds.height });
+  return { x: Math.min(a.x, b.x), y: Math.min(a.y, b.y), width: Math.abs(b.x - a.x), height: Math.abs(b.y - a.y) };
+}
+
+/**
+ * A loaded model's hit areas: the ones its file lists or, when it lists none,
+ * art meshes named like hit areas ("TouchHead") that are on the model's canvas
+ * in its starting pose. Game models often park the meshes of hit areas they
+ * only use in some scenes far off the canvas; those are left out.
+ */
+function hitAreaDefsFor(model: any, json: any, cubism: 2 | 4): HitAreaDef[] {
+  const listed = hitAreaDefsFromBundle(json, cubism);
+  if (listed.length > 0) return listed;
+  let ids: string[] = [];
+  try {
+    ids = model.internalModel.getDrawableIDs() ?? [];
+    // Make sure the meshes are posed (the starting pose) before measuring them.
+    if (detectHitAreaMeshes(ids).length > 0) model.internalModel.coreModel?.update?.();
+  } catch {
+    return [];
+  }
+  const { width, height } = modelSize(model);
+  const defs: HitAreaDef[] = [];
+  for (const id of detectHitAreaMeshes(ids)) {
+    if (defs.some((def) => def.name === id)) continue;
+    const rect = drawableRect(model, id);
+    if (!rect || rect.width <= 0 || rect.height <= 0) continue;
+    const onCanvas = rect.x < width && rect.y < height && rect.x + rect.width > 0 && rect.y + rect.height > 0;
+    if (onCanvas) defs.push({ name: id, drawableId: id, detected: true });
+  }
+  return defs;
+}
+
+function describeHitAreas(defs: HitAreaDef[]): Pick<ModelDescription, 'hitAreas' | 'hitAreasDetected'> {
+  return {
+    hitAreas: [...new Set(defs.map((def) => def.name))],
+    hitAreasDetected: defs.length > 0 && defs.every((def) => def.detected),
   };
 }
 
@@ -524,12 +575,16 @@ export class Stage {
     }
 
     const parameterIds: string[] = model.internalModel.coreModel?._model?.parameters?.ids ?? [];
+    const hitAreaDefs = hitAreaDefsFor(model, json, bundle.cubism);
     const description: ModelDescription = {
       ...partialDescription,
+      ...describeHitAreas(hitAreaDefs),
       parameterIds: [...parameterIds].sort(),
       size: modelSize(model),
     };
     this.descriptionCache.set(`${record.id}@${record.version}`, description);
+    // Hit areas found in the model itself get settings rows (and their tap motions) now.
+    this.deps.getModelSettings(characterId, record.id, description);
     this.autoDetectParameters(modelSettings, description.parameterIds);
 
     const { app, canvas } = this.createApp(PIXI, host);
@@ -553,7 +608,7 @@ export class Stage {
       loopingMotion: null,
       starterTimer: null,
       thumbnailTimer: null,
-      hitAreaDefs: hitAreaDefsFromBundle(json, bundle.cubism),
+      hitAreaDefs,
       areaFrames: null,
       flash: null,
     };
@@ -742,7 +797,12 @@ export class Stage {
     const live = this.loaded.find((entry) => entry.modelId === record.id);
     if (live) {
       const parameterIds: string[] = live.model.internalModel.coreModel?._model?.parameters?.ids ?? [];
-      const description = { ...partial, parameterIds: [...parameterIds].sort(), size: modelSize(live.model) };
+      const description = {
+        ...partial,
+        ...describeHitAreas(live.hitAreaDefs),
+        parameterIds: [...parameterIds].sort(),
+        size: modelSize(live.model),
+      };
       this.descriptionCache.set(`${record.id}@${record.version}`, description);
       return description;
     }
@@ -750,9 +810,10 @@ export class Stage {
     const { model, objectUrls } = await this.instantiate(PIXI, bundle, json, 45);
     const parameterIds: string[] = model.internalModel.coreModel?._model?.parameters?.ids ?? [];
     const size = modelSize(model);
+    const hitAreas = describeHitAreas(hitAreaDefsFor(model, json, bundle.cubism));
     model.destroy(true, true, true);
     objectUrls.forEach((url) => URL.revokeObjectURL(url));
-    const description: ModelDescription = { ...partial, parameterIds: [...parameterIds].sort(), size };
+    const description: ModelDescription = { ...partial, ...hitAreas, parameterIds: [...parameterIds].sort(), size };
     this.descriptionCache.set(`${record.id}@${record.version}`, description);
     return description;
   }
@@ -1118,15 +1179,7 @@ export class Stage {
 
   /** Where a hit area from the model file is right now, in the model's local coordinates; null if it has no drawable. */
   private modelAreaRect(entry: LoadedEntry, def: HitAreaDef): LocalRect | null {
-    const internal = entry.model?.internalModel;
-    const index = internal?.getDrawableIndex?.(def.drawableId);
-    if (typeof index !== 'number' || index < 0) return null;
-    // Drawable bounds are in the model's own pixels; its local transform maps them onto the canvas.
-    const bounds = internal.getDrawableBounds(index, {});
-    const transform = internal.localTransform;
-    const a = transform.apply({ x: bounds.x, y: bounds.y });
-    const b = transform.apply({ x: bounds.x + bounds.width, y: bounds.y + bounds.height });
-    return { x: Math.min(a.x, b.x), y: Math.min(a.y, b.y), width: Math.abs(b.x - a.x), height: Math.abs(b.y - a.y) };
+    return drawableRect(entry.model, def.drawableId);
   }
 
   private customAreaRect(entry: LoadedEntry, area: CustomHitArea): LocalRect {
