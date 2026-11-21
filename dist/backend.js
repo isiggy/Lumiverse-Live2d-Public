@@ -800,13 +800,14 @@ function sampleClassifyText(text) {
   }
   return result.trim();
 }
-async function classifyExpression(text) {
+async function classifyExpression(text, userId) {
   if (!text || !spindle.permissions.has("generation"))
     return FALLBACK_EXPRESSION;
   const labels = CLASSIFY_EXPRESSIONS.join(", ");
   try {
     const result = await spindle.generate.quiet({
       type: "quiet",
+      ...userId ? { userId } : {},
       messages: [
         {
           role: "system",
@@ -863,7 +864,7 @@ async function handleCharacterMessage(chatId, message, userId) {
     return;
   if (!text)
     return;
-  const label = await classifyExpression(text);
+  const label = await classifyExpression(text, userId);
   send({ type: "expression", chatId, characterId, label, source: "llm" }, userId);
 }
 async function handleInteraction(msg, userId) {
@@ -929,7 +930,7 @@ spindle.onFrontendMessage(async (payload, userId) => {
         await sendChatContext(msg.chatId, userId);
         break;
       case "classify_test": {
-        const label = await classifyExpression(msg.text);
+        const label = await classifyExpression(msg.text, userId);
         send({ type: "classify_test_result", label }, userId);
         break;
       }
