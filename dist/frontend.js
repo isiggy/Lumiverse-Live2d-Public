@@ -860,7 +860,9 @@ function defaultGlobalSettings() {
     showFrames: false,
     expressionSource: "llm",
     librarySort: "name",
-    libraryView: "tiles"
+    libraryView: "tiles",
+    showHelp: true,
+    showReloadButton: true
   };
 }
 function defaultSettings() {
@@ -2517,6 +2519,9 @@ function field(label, ...controls) {
 function note(text) {
   return el("p", "l2d-note", text);
 }
+function help(text) {
+  return el("p", "l2d-note l2d-help", text);
+}
 function statusLine() {
   const root = el("span", "l2d-dim", "");
   root.setAttribute("role", "status");
@@ -2640,6 +2645,8 @@ class SettingsUI {
     this.pendingMounts = [];
     root.replaceChildren();
     root.classList.add("l2d-root");
+    root.classList.toggle("l2d-hide-help", !this.controller.getSettings().global.showHelp);
+    this.controller.syncChatBarButton();
     this.syncLayout = null;
     const controller = this.controller;
     const settings = controller.getSettings();
@@ -2662,6 +2669,7 @@ class SettingsUI {
         globals.enabled = value;
         controller.saveNow();
         controller.reloadStage();
+        controller.syncChatBarButton();
       }),
       checkbox("Show model as chat background", globals.backgroundMode, (value) => {
         globals.backgroundMode = value;
@@ -2684,8 +2692,34 @@ class SettingsUI {
         globals.expressionSource = value;
         controller.saveNow();
       })),
-      note("Each new character message plays the animation mapped to its emotion (Model settings → Emotion mappings)."),
-      controller.usingOverlay() ? null : note("Overlay permission not granted — the avatar renders in the preview box below.")
+      help("Each new character message plays the animation mapped to its emotion (Model settings → Emotion mappings)."),
+      controller.usingOverlay() ? null : note("Overlay permission not granted — the avatar renders in the preview box below."),
+      checkbox("Show help text", globals.showHelp, (value) => {
+        globals.showHelp = value;
+        controller.saveDebounced();
+        root.classList.toggle("l2d-hide-help", !value);
+      }, "The explanations under the settings, like this one.")
+    ]));
+    root.appendChild(section("Debug", [
+      checkbox("Reset model before animations (force animation)", globals.force_animation, (value) => {
+        globals.force_animation = value;
+        controller.saveDebounced();
+      }),
+      checkbox("Force animations to loop", globals.force_loop, (value) => {
+        globals.force_loop = value;
+        controller.saveDebounced();
+      }),
+      checkbox("Show model frames & hit areas", globals.showFrames, (value) => {
+        globals.showFrames = value;
+        controller.saveDebounced();
+        controller.stage.setShowFrames(value);
+      }),
+      checkbox("Reload button in the chat menu bar", globals.showReloadButton, (value) => {
+        globals.showReloadButton = value;
+        controller.saveDebounced();
+        controller.syncChatBarButton();
+      }, "Adds a button that reloads the Live2D models next to the chat’s other icons, above the message input."),
+      row(button("Reload Live2D", () => controller.reloadStage()))
     ]));
     if (!controller.usingOverlay()) {
       controller.embeddedHost.classList.add("l2d-embedded-host");
@@ -2759,7 +2793,7 @@ class SettingsUI {
         bindingSection.appendChild(note("Your library is empty: import a model in Model library below first."));
       }
       if (isGroup) {
-        bindingSection.appendChild(note("Group chat: every member with a model is shown, side by side in equal columns in member order " + "(Live2D and, with the Spine Avatars extension, Spine models). Zoom 1 fits the model in its column, " + "and X and Y offset and Fit to canvas work within that column. Where models overlap, Send to front and " + "Send to back in Model settings choose which one is drawn on top."));
+        bindingSection.appendChild(help("Group chat: every member with a model is shown, side by side in equal columns in member order " + "(Live2D and, with the Spine Avatars extension, Spine models). Zoom 1 fits the model in its column, " + "and X and Y offset and Fit to canvas work within that column. Where models overlap, Send to front and " + "Send to back in Model settings choose which one is drawn on top."));
       }
       const characterName = () => characters.find((character) => character.id === this.selectedCharacterId)?.name.replace(/ \(in this chat\)$/, "") ?? "Character";
       const fileStatus = el("span", "l2d-dim", this.fileStatusText);
@@ -2893,7 +2927,7 @@ class SettingsUI {
     library.appendChild(libraryList);
     this.renderLibraryList(libraryList);
     if (models.length > 0) {
-      library.appendChild(note("A sillytavern_settings.json preset in a model’s folder is applied automatically. " + "A model’s thumbnail is taken the first time it’s shown; the highlighted one is the selected character’s."));
+      library.appendChild(help("A sillytavern_settings.json preset in a model’s folder is applied automatically. " + "A model’s thumbnail is taken the first time it’s shown; the highlighted one is the selected character’s."));
     }
     root.appendChild(section("Model library", [library]));
     const testInput = el("input", "l2d-input");
@@ -2922,22 +2956,6 @@ class SettingsUI {
         classifyButton.click();
     });
     root.appendChild(section("Test emotion classification", [row(testInput, classifyButton), testResult], { open: false }));
-    root.appendChild(section("Debug", [
-      checkbox("Reset model before animations (force animation)", globals.force_animation, (value) => {
-        globals.force_animation = value;
-        controller.saveDebounced();
-      }),
-      checkbox("Force animations to loop", globals.force_loop, (value) => {
-        globals.force_loop = value;
-        controller.saveDebounced();
-      }),
-      checkbox("Show model frames & hit areas", globals.showFrames, (value) => {
-        globals.showFrames = value;
-        controller.saveDebounced();
-        controller.stage.setShowFrames(value);
-      }),
-      row(button("Reload Live2D", () => controller.reloadStage()))
-    ], { open: false }));
     for (const mount of this.pendingMounts.splice(0))
       mount();
   }
@@ -3138,7 +3156,7 @@ Used by ${used} character${used === 1 ? "" : "s"}` : ""}`;
       changed();
       applyLive();
     }, "Cuts off backdrops and effects that full-scene models draw past their own edges."));
-    view.appendChild(note("Drag the model on the stage to move it."));
+    view.appendChild(help("Drag the model on the stage to move it."));
     host.appendChild(section("View", [view]));
     const animationStatus = statusLine();
     const animations = el("div");
@@ -3165,7 +3183,7 @@ Used by ${used} character${used === 1 ? "" : "s"}` : ""}`;
       changed();
     });
     clickRow.appendChild(field("Message", clickMessage));
-    clickRow.appendChild(note("Plays when you click the model outside its hit areas. The message, if any, is posted to the chat."));
+    clickRow.appendChild(help("Plays when you click the model outside its hit areas. The message, if any, is posted to the chat."));
     animations.appendChild(clickRow);
     host.appendChild(section("Animations", [animations]));
     const emotionStatus = statusLine();
@@ -3207,7 +3225,7 @@ Used by ${used} character${used === 1 ? "" : "s"}` : ""}`;
     };
     renderClassify();
     classify.append(emotionStatus.root, grid);
-    classify.appendChild(note("A new character message plays the expression and motion mapped to its emotion. Dimmed rows play nothing. " + "A motion can also be one of the model’s taps: it plays what that tap is set to in Hit areas " + "(its motion, and its expression unless the emotion has one), without sending the tap’s message."));
+    classify.appendChild(help("A new character message plays the expression and motion mapped to its emotion. Dimmed rows play nothing. " + "A motion can also be one of the model’s taps: it plays what that tap is set to in Hit areas " + "(its motion, and its expression unless the emotion has one), without sending the tap’s message."));
     host.appendChild(section("Emotion mappings", [classify], { open: false }));
     const hitBody = el("div");
     this.renderHitAreas(hitBody, characterId, modelId, description, modelSettings, renderClassify);
@@ -3239,7 +3257,7 @@ Used by ${used} character${used === 1 ? "" : "s"}` : ""}`;
         applyLive();
       })));
     }
-    cursor.appendChild(note("The parameters the model turns toward the cursor (Global → Follow cursor). Auto-detected on first load when the model uses standard names."));
+    cursor.appendChild(help("The parameters the model turns toward the cursor (Global → Follow cursor). Auto-detected on first load when the model uses standard names."));
     host.appendChild(section("Cursor tracking", [cursor], { open: false }));
   }
   renderHitAreas(host, characterId, modelId, description, modelSettings, areasChanged) {
@@ -3267,7 +3285,7 @@ Used by ${used} character${used === 1 ? "" : "s"}` : ""}`;
       modelSettings.show_hit_areas = value;
       controller.saveDebounced();
     }));
-    host.appendChild(note("Tap a hit area on the model to play what it’s set to. Where areas overlap, the smallest one wins; " + "a tap anywhere else on the model plays the “On click” animation."));
+    host.appendChild(help("Tap a hit area on the model to play what it’s set to. Where areas overlap, the smallest one wins; " + "a tap anywhere else on the model plays the “On click” animation."));
     const card = (name, area, actions) => {
       const mapping = modelSettings.hit_areas[area] ??= { expression: "none", motion: "none", message: "" };
       const message = el("input", "l2d-input");
@@ -3333,7 +3351,7 @@ Used by ${used} character${used === 1 ? "" : "s"}` : ""}`;
     if (modelAreas.length > 0) {
       host.appendChild(el("div", "l2d-anim-title", description.hitAreasDetected ? "Found in the model" : "From the model file"));
       if (description.hitAreasDetected) {
-        host.appendChild(note("The model’s file lists no hit areas, but the model has art meshes named like them (Touch…, HitArea…), " + "as models from games often do. These follow the model’s animation."));
+        host.appendChild(help("The model’s file lists no hit areas, but the model has art meshes named like them (Touch…, HitArea…), " + "as models from games often do. These follow the model’s animation."));
       }
       for (const area of modelAreas) {
         host.appendChild(card(el("span", "l2d-mapping-name", area), area, []));
@@ -3486,6 +3504,7 @@ var UI_CSS = `
 .l2d-check input { margin: 2px 0 0; flex: none; accent-color: var(--lumiverse-primary, var(--lumiverse-accent)); }
 .l2d-check-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .l2d-hint { color: var(--lumiverse-text-dim); font-size: 12px; line-height: 1.4; }
+.l2d-hide-help .l2d-help, .l2d-hide-help .l2d-hint { display: none; }
 .l2d-select { max-width: 100%; min-width: 0; padding: 4px 6px; border-radius: var(--lumiverse-radius); border: 1px solid var(--lumiverse-border); background: var(--lumiverse-fill); color: var(--lumiverse-text); font: inherit; text-overflow: ellipsis; }
 .l2d-input { flex: 1; min-width: 120px; padding: 4px 8px; border-radius: var(--lumiverse-radius); border: 1px solid var(--lumiverse-border); background: var(--lumiverse-fill); color: var(--lumiverse-text); font: inherit; }
 .l2d-slider { margin: 6px 0 2px; }
@@ -3672,8 +3691,12 @@ var STAGE_CSS = `
 html.live2d-avatars-hover, html.live2d-avatars-hover * { cursor: grab !important; }
 html.live2d-avatars-tap, html.live2d-avatars-tap * { cursor: pointer !important; }
 html.live2d-avatars-drawing, html.live2d-avatars-drawing * { cursor: crosshair !important; }
+.live2d-avatars-bar-button { display: flex; align-items: center; justify-content: center; flex-shrink: 0; width: 30px; height: 26px; padding: 0; border: none; border-radius: var(--lcs-radius-xs, 6px); background: transparent; color: var(--lumiverse-text-dim, rgba(230, 230, 240, 0.4)); cursor: pointer; transition: color 120ms ease, background 120ms ease; }
+.live2d-avatars-bar-button:hover { color: var(--lumiverse-text, rgba(230, 230, 240, 0.92)); background: var(--lumiverse-fill, rgba(255, 255, 255, 0.06)); }
+.live2d-avatars-bar-button svg { width: 16px; height: 16px; }
 `;
 var TAB_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4.2"/><path d="M9.5 7.5h.01M14.5 7.5h.01"/><path d="M10 10c.6.6 1.3.9 2 .9s1.4-.3 2-.9"/><path d="M4.5 21c.8-3.6 3.9-6 7.5-6s6.7 2.4 7.5 6"/></svg>';
+var RELOAD_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 12a8.5 8.5 0 1 1-2.5-6"/><path d="M18.6 2.5v4h-4"/><circle cx="12" cy="10.2" r="2.2"/><path d="M8.3 16.4c.7-1.9 2.1-2.9 3.7-2.9s3 1 3.7 2.9"/></svg>';
 function downloadJson(fileName, value) {
   const url = URL.createObjectURL(new Blob([JSON.stringify(value, null, 2)], { type: "application/json" }));
   const link = document.createElement("a");
@@ -3828,6 +3851,23 @@ function setup(ctx) {
   };
   cleanups.push(() => setOverlayTracking(false));
   let classifyPending = null;
+  const chatBar = ctx.ui.mount("chat_actions");
+  chatBar.style.display = "contents";
+  const chatBarButton = document.createElement("button");
+  chatBarButton.type = "button";
+  chatBarButton.className = "live2d-avatars-bar-button";
+  chatBarButton.title = "Reload Live2D models";
+  chatBarButton.setAttribute("aria-label", "Reload Live2D models");
+  chatBarButton.innerHTML = RELOAD_ICON;
+  chatBarButton.addEventListener("click", () => controller.reloadStage());
+  const syncChatBarButton = () => {
+    const show = settings.global.enabled && settings.global.showReloadButton;
+    if (show && chatBarButton.parentElement !== chatBar)
+      chatBar.replaceChildren(chatBarButton);
+    else if (!show && chatBarButton.parentElement)
+      chatBarButton.remove();
+  };
+  cleanups.push(() => chatBarButton.remove());
   const controller = {
     getSettings: () => settings,
     getModels: () => models,
@@ -3841,6 +3881,7 @@ function setup(ctx) {
       applyBackgroundMode();
       stage.reload();
     },
+    syncChatBarButton: () => syncChatBarButton(),
     importZip: async (status) => {
       const files = await ctx.uploads.pickFile({
         accept: [".zip", "application/zip"],
