@@ -19,11 +19,10 @@
 //                                 # and both extensions share the columns and the stacking order
 //                                 # (Send to front / Send to back, which model gets the pointer)
 //   lumiverse.sh e2e --group --stack --spine-model …  # only the stacking checks of a mixed group
-//   lumiverse.sh e2e --group --reorder --spine-model …  # only the reordering checks of a mixed group:
-//                                 # dragging a model into another column moves it there (and the
-//                                 # others over) in both extensions, the order survives a reload, and
-//                                 # a right-click or long press on a model opens its menu (Move
-//                                 # left / right, Send to front / back)
+//   lumiverse.sh e2e --group --place --spine-model …  # only the placement checks of a mixed group:
+//                                 # a model dragged across the screen stays where it's dropped and the
+//                                 # others don't move, also after a reload, and a right-click or long
+//                                 # press on a model opens its Send to front / back menu
 //   lumiverse.sh e2e --hit-areas  # then draw a hit area on the model's face in Model settings, and
 //                                 # check taps on it play its motion (upright, rotated, after a reload)
 //                                 # while taps elsewhere fall back to On click
@@ -45,7 +44,7 @@ const keepOpen = process.argv.includes('--keep-open');
 const testLibrary = process.argv.includes('--library');
 const group = process.argv.includes('--group');
 const stackOnly = process.argv.includes('--stack');
-const reorderOnly = process.argv.includes('--reorder');
+const placeOnly = process.argv.includes('--place');
 const testHitAreas = process.argv.includes('--hit-areas');
 const testBackground = process.argv.includes('--background');
 // How long a model may take to appear: big models under swiftshader can take many minutes.
@@ -468,15 +467,15 @@ async function columnInfo(ext, columns) {
 
 const center = (box) => (box ? box.x + box.width / 2 : NaN);
 
-/** Wait until every member's model is drawn somewhere in its column (big models take a while to arrive). */
+/** Wait until every member's model is drawn somewhere in its column (big models take a while to arrive); null skips a member. */
 async function waitForModels(owners) {
   const deadline = Date.now() + 600000;
   while (Date.now() < deadline) {
-    const used = [...new Set(owners)];
+    const used = [...new Set(owners.filter(Boolean))];
     const infos = Object.fromEntries(
       await Promise.all(used.map(async (key) => [key, await columnInfo(EXTENSIONS[key], owners.length)])),
     );
-    if (owners.every((owner, index) => (infos[owner]?.columns[index]?.drawn ?? 0) > 0.01)) return;
+    if (owners.every((owner, index) => owner === null || (infos[owner]?.columns[index]?.drawn ?? 0) > 0.01)) return;
     await page.waitForTimeout(3000);
   }
   console.log('Some models still missing after 10 minutes');
@@ -728,14 +727,6 @@ async function runGroup() {
 
   await page.goto(groupChat);
   await page.waitForTimeout(5000);
-  // Columns in member order, whatever an earlier run arranged: a newer column
-  // order on the shared registry, which both extensions take and save.
-  await page.evaluate((members) => {
-    const registry = window.__lumiverseAvatarColumns;
-    if (!registry) return;
-    registry.order = { characterIds: members, at: Date.now() };
-    window.dispatchEvent(new CustomEvent('lumiverse-avatar-columns-changed', { detail: { extension: 'e2e' } }));
-  }, members);
   await openTab(live2d);
   for (const zip of MODEL_ZIPS) await importInto(live2d, zip);
   if (mixed) {
@@ -790,7 +781,7 @@ async function runGroup() {
   await page.waitForTimeout(3000);
   await page.screenshot({ path: `${OUT}/group-chat.png` });
   const before = await checkColumns(owners, 'group chat');
-  if (reorderOnly) return checkReorder(members, owners);
+  if (placeOnly) return checkPlacement(members, owners);
   if (mixed) await checkStacking(members, owners);
   if (stackOnly) return;
 
@@ -844,10 +835,11 @@ async function runGroup() {
   const draggedX = await sliderValue('X offset');
   const columnWidth = afterLive2D.width / members.length;
   // The model follows the pointer exactly (40px from x = 0 after Fit); its drawn box can move less.
-  const expectedX = (40 / (columnWidth / 2)) * 100;
+  // X offset 100 is the stage's right edge, measured from the column's middle.
+  const expectedX = (40 / (afterLive2D.width - columnWidth / 2)) * 100;
   check(
-    Math.abs(draggedX - expectedX) < 3,
-    `member 1's X offset is relative to its column: ${draggedX}% (expected about ${expectedX.toFixed(1)}%)`,
+    Math.abs(draggedX - expectedX) < 1,
+    `member 1's X offset runs from its column's middle to the stage's edge: ${draggedX}% (expected about ${expectedX.toFixed(1)}%)`,
   );
   await clickIn(live2d, 'Fit to canvas');
   await page.keyboard.press('Escape');
@@ -876,12 +868,7 @@ async function runGroup() {
     { chatId: GROUP_CHAT_ID, characterId: removed },
   );
   await page.waitForTimeout(5000);
-  // It rejoins at the end, unless the columns were rearranged before (then it goes back to its place).
-  const arranged = await page.evaluate(
-    (characterId) => !!window.__lumiverseAvatarColumns?.order?.characterIds.includes(characterId),
-    removed,
-  );
-  const rejoined = arranged ? owners : [...owners.filter((_, index) => index !== removedIndex), owners[removedIndex]];
+  const rejoined = [...owners.filter((_, index) => index !== removedIndex), owners[removedIndex]];
   await page.screenshot({ path: `${OUT}/group-member-added.png` });
   await checkColumns(rejoined, 'after adding the member back');
   // Restore the original member order for the next run.
@@ -955,76 +942,77 @@ async function touchHold(x, y, holdMs) {
 }
 
 /**
- * Reordering in a mixed group (members take Live2D and Spine models in turn):
- * dragging member 1's Live2D model one column right moves it into member 2's
- * column and member 2's Spine model into column 1, in both extensions; the
- * order survives a reload; and the model menu (right-click, or a long touch)
- * moves models back and restacks them.
+ * Placement in a mixed group (members take Live2D and Spine models in turn):
+ * member 1's Live2D model dragged across the screen stays where it's dropped
+ * while every other model stays in its column, also after a reload; and the
+ * model menu (right-click, or a long touch) has Send to front / Send to back.
  */
-async function checkReorder(members, owners) {
-  console.log('── Reordering ──');
+async function checkPlacement(members, owners) {
+  console.log('── Placement ──');
   const live2d = EXTENSIONS.live2d;
+  const spine = EXTENSIONS.spine;
   const count = members.length;
   const width = 1440 / count;
-  const swapped = [owners[1], owners[0], ...owners.slice(2)];
+  const spineColumns = owners.flatMap((owner, index) => (owner === 'spine' ? [index] : []));
+  const spineBefore = await columnInfo(spine, count);
 
-  const info = await columnInfo(live2d, count);
-  const box = info.columns[0].box;
+  // Drag member 1's model 2.5 columns right: past member 2 and over member 3.
+  const box = (await columnInfo(live2d, count)).columns[0].box;
   const grabX = center(box);
   const grabY = box.y + box.height * 0.4;
+  const dropX = grabX + width * 2.5;
   await page.mouse.move(grabX, grabY);
   await page.mouse.down();
-  for (let step = 1; step <= 12; step++) await page.mouse.move(grabX + (width * step) / 12, grabY);
-  await page.waitForTimeout(500);
-  await page.screenshot({ path: `${OUT}/reorder-dragging.png` });
+  for (let step = 1; step <= 15; step++) await page.mouse.move(grabX + (width * 2.5 * step) / 15, grabY);
   await page.mouse.up();
   await page.waitForTimeout(1500);
-  await page.screenshot({ path: `${OUT}/reorder-dropped.png` });
-  const infos = await checkColumns(swapped, 'after dragging member 1 one column right');
-  const dropped = center(infos.live2d?.columns[1]?.box);
-  check(
-    Math.abs(dropped - (grabX + width)) < 40,
-    `member 1's model stays where it was dropped (center ${Math.round(dropped)}, dropped at ${Math.round(grabX + width)})`,
-  );
+  await page.screenshot({ path: `${OUT}/place-dropped.png` });
+
+  const placed = async (what) => {
+    const info = await columnInfo(live2d, count);
+    const spineNow = await columnInfo(spine, count);
+    check((info?.columns[0]?.drawn ?? 1) < 0.005, `${what}: member 1's model has left column 1 (${((info?.columns[0]?.drawn ?? 0) * 100).toFixed(1)}% drawn there)`);
+    // Member 1's model now overlaps member 3's: Live2D draws more in columns 3 and 4 than before.
+    const right = (info?.columns[2]?.drawn ?? 0) + (info?.columns[3]?.drawn ?? 0);
+    check(right > 0.2, `${what}: member 1's model is drawn over on the right, where it was dropped (columns 3-4: ${(right * 100).toFixed(1)}%)`);
+    for (const index of spineColumns) {
+      const shift = Math.abs(center(spineNow.columns[index].box) - center(spineBefore.columns[index].box));
+      check(shift < 20, `${what}: member ${index + 1}'s Spine model stays in its column (moved ${Math.round(shift)}px)`);
+    }
+  };
+  await placed('after dragging member 1 across the screen');
 
   await page.reload();
   await page.waitForTimeout(3000);
-  await waitForModels(swapped);
-  await page.waitForTimeout(2000);
-  await checkColumns(swapped, 'after a reload');
+  // Member 1's model isn't in its column any more: wait for the others.
+  await waitForModels(owners.map((owner, index) => (index === 0 ? null : owner)));
+  await page.waitForTimeout(3000);
+  await placed('after a reload');
 
-  // Right-click member 1's model (now in column 2): Move left puts it back.
-  const moved = (await columnInfo(live2d, count)).columns[1].box;
-  await page.mouse.click(center(moved), moved.y + moved.height * 0.4, { button: 'right' });
+  // Right-click member 1's model where it was dropped: the menu has Send to front / back only.
+  const dropY = grabY;
+  await page.mouse.click(dropX, dropY, { button: 'right' });
   let menu = await openMenu();
   const items = menu ? await menu.locator('button').allInnerTexts() : [];
   check(
-    ['Send to front', 'Send to back', 'Move left', 'Move right'].every((label) => items.includes(label)),
+    items.includes('Send to front') && items.includes('Send to back') && !items.some((item) => item.startsWith('Move')),
     `a right-click on a model opens its menu (${items.join(', ') || 'no menu'})`,
   );
-  await page.screenshot({ path: `${OUT}/reorder-menu.png` });
-  if (menu) {
-    await menu.locator("button", { hasText: "Move left" }).click();
-    await page.waitForTimeout(1500);
-  }
-  await checkColumns(owners, 'after Move left in the menu');
-  await page.screenshot({ path: `${OUT}/reorder-move-left.png` });
+  await page.screenshot({ path: `${OUT}/place-menu.png` });
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(500);
 
-  // A long touch on member 2's model (column 2) opens the menu too. Send to
-  // front (or, when an earlier run left it in front and that item is greyed
-  // out, Send to back) restacks it.
+  // A long touch on member 2's model opens the menu too. Send to front (or,
+  // when an earlier run left it in front and that item is greyed out, Send
+  // to back) restacks it.
   const ext = EXTENSIONS[owners[1]];
   const target = (await columnInfo(ext, count)).columns[1].box;
   menu = await touchHold(center(target), target.y + target.height * 0.4, 900);
   check(!!menu, `a long touch on member 2's ${ext.tab} model opens its menu`);
-  await page.screenshot({ path: `${OUT}/reorder-long-press-menu.png` });
+  await page.screenshot({ path: `${OUT}/place-long-press-menu.png` });
   if (menu) {
     const front = menu.locator('button', { hasText: 'Send to front' });
     const toFront = await front.isEnabled();
-    check(
-      toFront || (await menu.locator('button', { hasText: 'Send to back' }).isEnabled()),
-      'the menu offers Send to front or Send to back',
-    );
     await (toFront ? front : menu.locator('button', { hasText: 'Send to back' })).click();
     await page.waitForTimeout(1500);
     const stack = await canvasStack(count);
@@ -1037,6 +1025,14 @@ async function checkReorder(members, owners) {
   // A right-click off the models leaves the browser's own menu alone.
   await page.mouse.click(5, 450, { button: 'right' });
   check(!(await openMenu()), 'a right-click away from the models opens no model menu');
+
+  // Fit to canvas puts member 1's model back in its column.
+  await openTab(live2d);
+  await selectCharacterIn(live2d, members[0]);
+  await clickIn(live2d, 'Fit to canvas');
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(1500);
+  await checkColumns(owners, 'after Fit to canvas');
 }
 
 /** The Hit areas section of Model settings, opened. */
