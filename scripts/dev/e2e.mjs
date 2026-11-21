@@ -918,6 +918,29 @@ async function tapAt(x, y, screenshot) {
   return after.count > before.count ? after.area : null;
 }
 
+/** Whether a Live2D canvas has a drawn (non-transparent) pixel at this viewport point. */
+function drawnAt(x, y) {
+  return page.evaluate(
+    ({ x, y }) =>
+      new Promise((resolve) => {
+        const probe = document.createElement('canvas');
+        probe.width = 1;
+        probe.height = 1;
+        const context = probe.getContext('2d', { willReadFrequently: true });
+        requestAnimationFrame(() => {
+          for (const canvas of document.querySelectorAll('.live2d-avatars-canvas')) {
+            const rect = canvas.getBoundingClientRect();
+            const sx = ((x - rect.left) / rect.width) * canvas.width;
+            const sy = ((y - rect.top) / rect.height) * canvas.height;
+            context.drawImage(canvas, sx, sy, 1, 1, 0, 0, 1, 1);
+          }
+          resolve(context.getImageData(0, 0, 1, 1).data[3] > 16);
+        });
+      }),
+    { x, y },
+  );
+}
+
 async function reopenChat() {
   await page.goto(CHAT);
   await page.waitForSelector('.live2d-avatars-canvas', { timeout: LOAD_TIMEOUT });
@@ -943,7 +966,7 @@ async function hitAreaTest(freshBinding) {
   if (fileAreas.length === 0) {
     check(text.includes('defines no hit areas'), 'a model without hit areas says so and offers drawing them');
   } else {
-    console.log(`Hit areas from the model file: ${fileAreas.join(', ')}`);
+    console.log(`Hit areas from the model: ${fileAreas.join(', ')}`);
     // Give every file area a motion, so a tap on the model's body lands on one.
     for (const area of fileAreas) {
       const motion = section.locator(`.l2d-row:has(> span.l2d-emotion:text-is("${area}")) select`).nth(1);
@@ -1010,7 +1033,13 @@ async function hitAreaTest(freshBinding) {
   const bodyTap = await tapAt(center.x, center.y + 50, fileAreas.length ? `${OUT}/hit-4b-tap-body.png` : undefined);
   if (fileAreas.length === 0) check(bodyTap === '', 'a tap on the body plays On click');
   else check(fileAreas.includes(bodyTap), `a tap on the body hits one of the model file's areas (${bodyTap})`);
-  check((await tapAt(center.x - 500, center.y)) === null, 'a tap beside the model is not a tap on it');
+  const beside = { x: center.x - 500, y: center.y };
+  if (await drawnAt(beside.x, beside.y)) {
+    // A full-scene model (baifeng_3) draws its backdrop over the whole stage.
+    console.log('skip a tap beside the model: the model draws there too');
+  } else {
+    check((await tapAt(beside.x, beside.y)) === null, 'a tap beside the model is not a tap on it');
+  }
 
   // Rotated 90° counterclockwise about the model's center, the head is to the left of it.
   await openLive2DTab();
