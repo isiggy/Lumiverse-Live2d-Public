@@ -428,13 +428,23 @@ class SharedColumns {
       canvases.forEach((canvas, index) => canvas.style.pointerEvents = previous[index]);
     }
     const hitTests = registry().hitTests ?? {};
+    const background = findLayer("background");
+    const behindChat = !!background?.querySelector(`[${OWNER_ATTRIBUTE}]`);
+    let through = false;
     for (const element of elements) {
       const extension = element.getAttribute(OWNER_ATTRIBUTE);
-      if (!extension)
+      if (!extension) {
+        if (behindChat && seeThroughAt(element, clientX, clientY)) {
+          through = true;
+          continue;
+        }
         return null;
+      }
+      if (through && element.parentElement !== background)
+        continue;
       const characterId = hitTests[extension]?.(element, clientX, clientY) ?? null;
       if (characterId)
-        return { extension, characterId };
+        return { extension, characterId, through };
     }
     return null;
   }
@@ -449,6 +459,71 @@ class SharedColumns {
     delete shared.extensions[this.extensionId];
     window.dispatchEvent(new CustomEvent(CHANGED_EVENT, { detail: { extension: this.extensionId } }));
   }
+}
+var INTERACTIVE_SELECTOR = [
+  "input",
+  "textarea",
+  "select",
+  "button",
+  "a[href]",
+  "label",
+  "summary",
+  "img",
+  "video",
+  "audio",
+  "canvas",
+  "svg",
+  "iframe",
+  "object",
+  "embed",
+  '[contenteditable]:not([contenteditable="false"])',
+  '[role="button"]',
+  '[role="textbox"]',
+  '[role="menuitem"]',
+  '[role="tab"]',
+  '[role="slider"]',
+  '[role="dialog"]'
+].join(",");
+var OWN_CURSORS = ".live2d-avatars-hover, .live2d-avatars-tap, .spine-avatars-hover, .spine-avatars-tap";
+function clearColor(color) {
+  if (color === "transparent")
+    return true;
+  const match = /rgba?\(([^)]*)\)/.exec(color);
+  if (!match)
+    return false;
+  const parts = match[1].split(/[\s,/]+/).filter(Boolean);
+  return parts.length >= 4 && Number.parseFloat(parts[3]) <= 0.02;
+}
+function seeThroughAt(element, clientX, clientY) {
+  if (!(element instanceof HTMLElement))
+    return false;
+  if (element === document.documentElement || element === document.body)
+    return false;
+  if (element.closest(INTERACTIVE_SELECTOR))
+    return false;
+  const style = getComputedStyle(element);
+  if (!clearColor(style.backgroundColor) || style.backgroundImage !== "none")
+    return false;
+  if (style.backdropFilter && style.backdropFilter !== "none")
+    return false;
+  if ((style.cursor === "pointer" || style.cursor === "text") && !document.documentElement.matches(OWN_CURSORS)) {
+    return false;
+  }
+  const rect = element.getBoundingClientRect();
+  if (clientX > rect.left + element.clientLeft + element.clientWidth || clientY > rect.top + element.clientTop + element.clientHeight) {
+    return false;
+  }
+  const range = document.createRange();
+  for (const node of element.childNodes) {
+    if (node.nodeType !== Node.TEXT_NODE || !node.textContent?.trim())
+      continue;
+    range.selectNodeContents(node);
+    for (const box of range.getClientRects()) {
+      if (clientX >= box.left && clientX <= box.right && clientY >= box.top && clientY <= box.bottom)
+        return false;
+    }
+  }
+  return true;
 }
 function findLayer(kind) {
   return document.querySelector(`[${LAYER_ATTRIBUTE}="${kind}"]`);
@@ -523,6 +598,13 @@ function hitAreaDefsFromBundle(bundleJson, cubism) {
       defs.push({ name, drawableId });
   }
   return defs;
+}
+var TAP_PREFIX = "tap:";
+function tapMotion(area) {
+  return TAP_PREFIX + area;
+}
+function tappedArea(motion) {
+  return motion.startsWith(TAP_PREFIX) ? motion.slice(TAP_PREFIX.length) : null;
 }
 var squash = (text) => text.toLowerCase().replace(/[^a-z0-9]/g, "");
 function groupMotion(motions, wanted) {
@@ -976,12 +1058,14 @@ var DEFAULT_LOOP_GROUP = "__live2d_avatars_default__";
 var EXPRESSION_HOLD_MS = 5000;
 var THUMBNAIL_DELAY_MS = 1500;
 var HIT_FLASH_MS = 600;
+var TAP_MAX_MS = 500;
+var TAP_SLOP_PX = 8;
 var MIN_DRAWN_AREA = 0.01;
 var MODEL_AREA_COLOR = 4891647;
 var CUSTOM_AREA_COLOR = 16752704;
 var DRAWING_AREA_COLOR = 6217866;
 var EXTENSION_ID = "live2d_avatars";
-var INTERACTIVE_SELECTOR = [
+var INTERACTIVE_SELECTOR2 = [
   "input",
   "textarea",
   "select",
@@ -1125,6 +1209,7 @@ class Stage {
   descriptionCache = new Map;
   drag = null;
   suppressClick = false;
+  pendingTap = null;
   drawing = null;
   hoverFrame = null;
   hovering = false;
@@ -1133,6 +1218,7 @@ class Stage {
     [document, "pointermove", (event) => this.onPointerMove(event), { capture: true }],
     [document, "pointerup", (event) => this.onPointerUp(event), { capture: true }],
     [document, "pointercancel", () => this.endDrag(), { capture: true }],
+    [document, "scroll", () => this.pendingTap = null, { capture: true, passive: true }],
     [document, "click", (event) => this.onClickCapture(event), { capture: true }],
     [document, "touchstart", (event) => this.capturing() && event.preventDefault(), { capture: true, passive: false }],
     [document, "touchmove", (event) => this.capturing() && event.preventDefault(), { capture: true, passive: false }],
@@ -1646,10 +1732,17 @@ class Stage {
     if (this.loaded.length === 0)
       return null;
     const target = event.target instanceof Element ? event.target : null;
-    if (target?.closest(INTERACTIVE_SELECTOR))
+    if (target?.closest(INTERACTIVE_SELECTOR2))
       return null;
     const hit = this.sharedColumns.topmostAt(event.clientX, event.clientY);
-    return hit?.extension === EXTENSION_ID ? this.entryFor(hit.characterId) ?? null : null;
+    const entry = hit?.extension === EXTENSION_ID ? this.entryFor(hit.characterId) : undefined;
+    return entry ? { entry, through: hit.through } : null;
+  }
+  tapDoesSomething(entry, point) {
+    const settings = this.storedSettings(entry);
+    if (!settings)
+      return false;
+    return this.hitAreasAt(entry, point, settings).length > 0 || !isEmptyMapping(settings.animation_click);
   }
   isOverModel(entry, point) {
     const PIXI = window.PIXI;
@@ -1689,9 +1782,14 @@ class Stage {
       this.startDrawingPress(event);
       return;
     }
-    const entry = this.modelAt(event);
-    if (!entry)
+    const hit = this.modelAt(event);
+    if (!hit)
       return;
+    const { entry } = hit;
+    if (hit.through) {
+      this.pendingTap = { entry, pointerId: event.pointerId, x: event.clientX, y: event.clientY, at: performance.now() };
+      return;
+    }
     event.preventDefault();
     event.stopPropagation();
     const point = this.toStagePoint(event);
@@ -1721,6 +1819,10 @@ class Stage {
       this.dragTo(drag, event);
       return;
     }
+    const pending = this.pendingTap;
+    if (pending && event.pointerId === pending.pointerId && Math.hypot(event.clientX - pending.x, event.clientY - pending.y) > TAP_SLOP_PX) {
+      this.pendingTap = null;
+    }
     if (this.loaded.length === 0)
       return;
     if (this.deps.getSettings().global.followCursor) {
@@ -1740,7 +1842,13 @@ class Stage {
           const entry = this.entryFor(this.drawing.characterId);
           this.setDrawCursor(!!entry && this.canvasReachableAt(entry, event) && this.onModelCanvas(entry, event));
         } else {
-          this.setHovering(this.modelAt(event) !== null);
+          const hit = this.modelAt(event);
+          if (!hit)
+            this.setHovering(false);
+          else if (!hit.through)
+            this.setHovering("grab");
+          else
+            this.setHovering(this.tapDoesSomething(hit.entry, this.toStagePoint(event)) ? "tap" : false);
         }
       });
     }
@@ -1774,6 +1882,15 @@ class Stage {
       this.endDrag();
       return;
     }
+    const pending = this.pendingTap;
+    if (pending && event.pointerId === pending.pointerId) {
+      this.pendingTap = null;
+      const selection = window.getSelection();
+      if (this.loaded.includes(pending.entry) && performance.now() - pending.at <= TAP_MAX_MS && Math.hypot(event.clientX - pending.x, event.clientY - pending.y) <= TAP_SLOP_PX && (!selection || selection.isCollapsed)) {
+        this.onModelClick(pending.entry, event);
+      }
+      return;
+    }
     const drag = this.drag;
     if (!drag || event.pointerId !== drag.pointerId)
       return;
@@ -1785,6 +1902,7 @@ class Stage {
   }
   endDrag() {
     this.drag = null;
+    this.pendingTap = null;
     window.setTimeout(() => {
       this.suppressClick = false;
     }, 0);
@@ -1800,7 +1918,8 @@ class Stage {
     if (hovering === this.hovering)
       return;
     this.hovering = hovering;
-    document.documentElement.classList.toggle("live2d-avatars-hover", hovering);
+    document.documentElement.classList.toggle("live2d-avatars-hover", hovering === "grab");
+    document.documentElement.classList.toggle("live2d-avatars-tap", hovering === "tap");
   }
   toStagePoint(event) {
     const rect = this.host?.getBoundingClientRect();
@@ -1902,7 +2021,7 @@ class Stage {
   }
   canvasReachableAt(entry, event) {
     const target = event.target instanceof Element ? event.target : null;
-    if (target?.closest(INTERACTIVE_SELECTOR))
+    if (target?.closest(INTERACTIVE_SELECTOR2))
       return false;
     const canvas = entry.canvas;
     const previous = canvas.style.pointerEvents;
@@ -2078,6 +2197,18 @@ class Stage {
       return;
     this.playExpression(entry.characterId, mapping.expression);
   }
+  expandTap(characterId, mapping) {
+    const area = tappedArea(mapping.motion);
+    if (area === null)
+      return mapping;
+    const entry = this.entryFor(characterId);
+    const settings = entry && this.storedSettings(entry);
+    const tap = area === "" ? settings?.animation_click : settings?.hit_areas[area];
+    if (entry && area !== "")
+      entry.flash = { name: area, until: performance.now() + HIT_FLASH_MS };
+    const motion = tap?.motion && tappedArea(tap.motion) === null ? tap.motion : "none";
+    return { expression: mapping.expression !== "none" ? mapping.expression : tap?.expression ?? "none", motion };
+  }
   async playExpression(characterId, expression) {
     const entry = this.entryFor(characterId);
     if (!entry || expression === "none")
@@ -2091,6 +2222,8 @@ class Stage {
     }
   }
   async playMotion(characterId, motion, force = false) {
+    if (tappedArea(motion) !== null)
+      motion = this.expandTap(characterId, { expression: "none", motion }).motion;
     if (!this.entryFor(characterId) || motion === "none")
       return;
     if (force || this.deps.getSettings().global.force_animation) {
@@ -2108,6 +2241,7 @@ class Stage {
       else
         await entry.model.motion(group, Number(id));
       entry.lastMotion = motion;
+      entry.canvas.dataset.live2dMotion = motion;
     } catch (error) {
       this.deps.log(`Motion "${motion}" failed: ${String(error)}`);
     }
@@ -2240,10 +2374,22 @@ function checkbox(label, checked, onChange) {
 }
 function select(options, value, onChange) {
   const node = el("select", "l2d-select");
+  const groups = new Map;
   for (const option of options) {
     const opt = el("option", undefined, option.label);
     opt.value = option.value;
-    node.appendChild(opt);
+    let parent = node;
+    if (option.group) {
+      let group = groups.get(option.group);
+      if (!group) {
+        group = el("optgroup");
+        group.label = option.group;
+        groups.set(option.group, group);
+        node.appendChild(group);
+      }
+      parent = group;
+    }
+    parent.appendChild(opt);
   }
   node.value = value;
   if (node.value !== value)
@@ -2360,6 +2506,13 @@ function motionOptions(description) {
     }
   }
   return options;
+}
+function emotionMotionOptions(description, modelSettings) {
+  const [none, ...motions] = motionOptions(description);
+  const areas = [...description?.hitAreas ?? [], ...modelSettings.custom_hit_areas.map((area) => area.name)];
+  const taps = [...new Set(areas)].filter(Boolean).map((area) => ({ value: tapMotion(area), label: `Tap ${area}`, group: "Taps (as set in Hit areas)" }));
+  taps.push({ value: tapMotion(""), label: "Tap the model (On click)", group: "Taps (as set in Hit areas)" });
+  return [none, ...motions.map((option) => ({ ...option, group: "Motions" })), ...taps];
 }
 function parameterOptions(description) {
   return [
@@ -2873,17 +3026,21 @@ Used by ${used} character${used === 1 ? "" : "s"}` : ""}`;
     animations.appendChild(clickRow);
     host.appendChild(section("Animations", animations));
     const classify = el("div");
-    for (const label of CLASSIFY_EXPRESSIONS) {
-      const mapping = modelSettings.classify_mapping[label];
-      classify.appendChild(row(el("span", "l2d-emotion", label), select(expressionOptions(description), mapping.expression, (value) => {
-        mapping.expression = value;
-        controller.saveDebounced();
-      }), select(motionOptions(description), mapping.motion, (value) => {
-        mapping.motion = value;
-        controller.saveDebounced();
-      }), button("▶", () => play(mapping))));
-    }
-    const classifySection = section("Emotion mappings", classify);
+    const renderClassify = () => {
+      classify.replaceChildren();
+      for (const label of CLASSIFY_EXPRESSIONS) {
+        const mapping = modelSettings.classify_mapping[label];
+        classify.appendChild(row(el("span", "l2d-emotion", label), select(expressionOptions(description), mapping.expression, (value) => {
+          mapping.expression = value;
+          controller.saveDebounced();
+        }), select(emotionMotionOptions(description, modelSettings), mapping.motion, (value) => {
+          mapping.motion = value;
+          controller.saveDebounced();
+        }), button("▶", () => play(controller.stage.expandTap(characterId, mapping)))));
+      }
+    };
+    renderClassify();
+    const classifySection = section("Emotion mappings", note("A motion can also be one of the model’s taps: it plays what that tap is set to in Hit areas " + "(its motion, and its expression unless the emotion has one), without sending the tap’s message."), classify);
     classifySection.open = false;
     host.appendChild(classifySection);
     const hitSection = section("Hit areas");
@@ -2895,15 +3052,16 @@ Used by ${used} character${used === 1 ? "" : "s"}` : ""}`;
     });
     const hitBody = el("div");
     hitSection.appendChild(hitBody);
-    this.renderHitAreas(hitBody, characterId, modelId, description, modelSettings);
+    this.renderHitAreas(hitBody, characterId, modelId, description, modelSettings, renderClassify);
     host.appendChild(hitSection);
   }
-  renderHitAreas(host, characterId, modelId, description, modelSettings) {
+  renderHitAreas(host, characterId, modelId, description, modelSettings, areasChanged) {
     const controller = this.controller;
     const stage = controller.stage;
     const rerender = () => {
       host.replaceChildren();
-      this.renderHitAreas(host, characterId, modelId, description, modelSettings);
+      this.renderHitAreas(host, characterId, modelId, description, modelSettings, areasChanged);
+      areasChanged();
     };
     const play = (mapping) => {
       stage.playExpression(characterId, mapping.expression);
@@ -3005,6 +3163,10 @@ Used by ${used} character${used === 1 ? "" : "s"}` : ""}`;
           delete modelSettings.hit_areas[area.name];
         if (mapping)
           modelSettings.hit_areas[next] = mapping;
+        for (const emotion of Object.values(modelSettings.classify_mapping)) {
+          if (emotion.motion === tapMotion(area.name))
+            emotion.motion = tapMotion(next);
+        }
         area.name = next;
         controller.saveDebounced();
         rerender();
@@ -3264,6 +3426,7 @@ var STAGE_CSS = `
 .live2d-avatars-overlay { position: fixed; inset: 0; pointer-events: none; z-index: 4; }
 .live2d-avatars-canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; background: transparent; }
 html.live2d-avatars-hover, html.live2d-avatars-hover * { cursor: grab !important; }
+html.live2d-avatars-tap, html.live2d-avatars-tap * { cursor: pointer !important; }
 html.live2d-avatars-drawing, html.live2d-avatars-drawing * { cursor: crosshair !important; }
 `;
 var TAB_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4.2"/><path d="M9.5 7.5h.01M14.5 7.5h.01"/><path d="M10 10c.6.6 1.3.9 2 .9s1.4-.3 2-.9"/><path d="M4.5 21c.8-3.6 3.9-6 7.5-6s6.7 2.4 7.5 6"/></svg>';
@@ -3593,7 +3756,7 @@ function setup(ctx) {
     if (!modelId)
       return;
     const modelSettings = getOrCreateModelSettings(characterId, modelId, stage.getDescription(characterId));
-    const mapping = modelSettings.classify_mapping[msg.label] ?? { expression: "none", motion: "none" };
+    const mapping = stage.expandTap(characterId, modelSettings.classify_mapping[msg.label] ?? { expression: "none", motion: "none" });
     let expression = mapping.expression;
     let motion = mapping.motion;
     if (expression === "none")

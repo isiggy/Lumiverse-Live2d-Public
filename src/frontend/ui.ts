@@ -6,7 +6,7 @@
  */
 
 import type { SpindleSelectHandle, SpindleSelectOptionLeading, SpindleSelectOptions } from 'lumiverse-spindle-types';
-import { applyTapMotions, suggestAreaMotion } from './hit-areas';
+import { applyTapMotions, suggestAreaMotion, tapMotion } from './hit-areas';
 import type { ModelDescription, Stage } from './stage';
 import {
   CLASSIFY_EXPRESSIONS,
@@ -91,16 +91,29 @@ function checkbox(label: string, checked: boolean, onChange: (value: boolean) =>
   return wrap;
 }
 
+/** A dropdown; options with a `group` go under that heading, in the order the groups first appear. */
 function select(
-  options: Array<{ value: string; label: string }>,
+  options: Array<{ value: string; label: string; group?: string }>,
   value: string,
   onChange: (value: string) => void,
 ): HTMLSelectElement {
   const node = el('select', 'l2d-select');
+  const groups = new Map<string, HTMLOptGroupElement>();
   for (const option of options) {
     const opt = el('option', undefined, option.label);
     opt.value = option.value;
-    node.appendChild(opt);
+    let parent: HTMLElement = node;
+    if (option.group) {
+      let group = groups.get(option.group);
+      if (!group) {
+        group = el('optgroup');
+        group.label = option.group;
+        groups.set(option.group, group);
+        node.appendChild(group);
+      }
+      parent = group;
+    }
+    parent.appendChild(opt);
   }
   node.value = value;
   if (node.value !== value) node.selectedIndex = 0;
@@ -252,6 +265,23 @@ function motionOptions(description: ModelDescription | null): Array<{ value: str
     }
   }
   return options;
+}
+
+/**
+ * Motions for an emotion: the model's motions, then its taps (each hit area,
+ * and "On click"), which play whatever the tap is set to in Hit areas.
+ */
+function emotionMotionOptions(
+  description: ModelDescription | null,
+  modelSettings: ModelSettings,
+): Array<{ value: string; label: string; group?: string }> {
+  const [none, ...motions] = motionOptions(description);
+  const areas = [...(description?.hitAreas ?? []), ...modelSettings.custom_hit_areas.map((area) => area.name)];
+  const taps = [...new Set(areas)]
+    .filter(Boolean)
+    .map((area) => ({ value: tapMotion(area), label: `Tap ${area}`, group: 'Taps (as set in Hit areas)' }));
+  taps.push({ value: tapMotion(''), label: 'Tap the model (On click)', group: 'Taps (as set in Hit areas)' });
+  return [none!, ...motions.map((option) => ({ ...option, group: 'Motions' })), ...taps];
 }
 
 function parameterOptions(description: ModelDescription | null): Array<{ value: string; label: string }> {
@@ -949,26 +979,37 @@ export class SettingsUI {
     animations.appendChild(clickRow);
     host.appendChild(section('Animations', animations));
 
-    // Emotion (classify) mappings
+    // Emotion (classify) mappings, built again when hit areas change (their taps are motion options).
     const classify = el('div');
-    for (const label of CLASSIFY_EXPRESSIONS) {
-      const mapping = modelSettings.classify_mapping[label]!;
-      classify.appendChild(
-        row(
-          el('span', 'l2d-emotion', label),
-          select(expressionOptions(description), mapping.expression, (value) => {
-            mapping.expression = value;
-            controller.saveDebounced();
-          }),
-          select(motionOptions(description), mapping.motion, (value) => {
-            mapping.motion = value;
-            controller.saveDebounced();
-          }),
-          button('▶', () => play(mapping)),
-        ),
-      );
-    }
-    const classifySection = section('Emotion mappings', classify);
+    const renderClassify = () => {
+      classify.replaceChildren();
+      for (const label of CLASSIFY_EXPRESSIONS) {
+        const mapping = modelSettings.classify_mapping[label]!;
+        classify.appendChild(
+          row(
+            el('span', 'l2d-emotion', label),
+            select(expressionOptions(description), mapping.expression, (value) => {
+              mapping.expression = value;
+              controller.saveDebounced();
+            }),
+            select(emotionMotionOptions(description, modelSettings), mapping.motion, (value) => {
+              mapping.motion = value;
+              controller.saveDebounced();
+            }),
+            button('▶', () => play(controller.stage.expandTap(characterId, mapping))),
+          ),
+        );
+      }
+    };
+    renderClassify();
+    const classifySection = section(
+      'Emotion mappings',
+      note(
+        'A motion can also be one of the model’s taps: it plays what that tap is set to in Hit areas ' +
+          '(its motion, and its expression unless the emotion has one), without sending the tap’s message.',
+      ),
+      classify,
+    );
     (classifySection as HTMLDetailsElement).open = false;
     host.appendChild(classifySection);
 
@@ -982,7 +1023,7 @@ export class SettingsUI {
     });
     const hitBody = el('div');
     hitSection.appendChild(hitBody);
-    this.renderHitAreas(hitBody, characterId, modelId, description, modelSettings);
+    this.renderHitAreas(hitBody, characterId, modelId, description, modelSettings, renderClassify);
     host.appendChild(hitSection);
   }
 
@@ -996,12 +1037,14 @@ export class SettingsUI {
     modelId: string,
     description: ModelDescription,
     modelSettings: ModelSettings,
+    areasChanged: () => void,
   ): void {
     const controller = this.controller;
     const stage = controller.stage;
     const rerender = () => {
       host.replaceChildren();
-      this.renderHitAreas(host, characterId, modelId, description, modelSettings);
+      this.renderHitAreas(host, characterId, modelId, description, modelSettings, areasChanged);
+      areasChanged();
     };
     const play = (mapping: { expression: string; motion: string }) => {
       void stage.playExpression(characterId, mapping.expression);
@@ -1116,6 +1159,10 @@ export class SettingsUI {
         const mapping = modelSettings.hit_areas[area.name];
         if (!modelAreas.includes(area.name)) delete modelSettings.hit_areas[area.name];
         if (mapping) modelSettings.hit_areas[next] = mapping;
+        // Emotions set to tap this area tap it under its new name.
+        for (const emotion of Object.values(modelSettings.classify_mapping)) {
+          if (emotion.motion === tapMotion(area.name)) emotion.motion = tapMotion(next);
+        }
         area.name = next;
         controller.saveDebounced();
         rerender();

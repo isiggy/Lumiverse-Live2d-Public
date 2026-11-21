@@ -49,6 +49,23 @@ export function hitAreaDefsFromBundle(bundleJson: any, cubism: 2 | 4): HitAreaDe
   return defs;
 }
 
+/**
+ * An emotion mapping's motion can be a tap instead of one of the model's
+ * motions: 'tap:<area>' plays what a tap on that hit area is set to (its
+ * expression and motion, not its message), and 'tap:' the "On click" animation.
+ */
+const TAP_PREFIX = 'tap:';
+
+/** The motion value that plays a tap on this hit area ('' for "On click"). */
+export function tapMotion(area: string): string {
+  return TAP_PREFIX + area;
+}
+
+/** The hit area a motion value taps ('' for "On click"), or null when it's an ordinary motion. */
+export function tappedArea(motion: string): string | null {
+  return motion.startsWith(TAP_PREFIX) ? motion.slice(TAP_PREFIX.length) : null;
+}
+
 const squash = (text: string) => text.toLowerCase().replace(/[^a-z0-9]/g, '');
 
 /** The motion value for a whole group ('<group>_id=random'), or 'none'. */

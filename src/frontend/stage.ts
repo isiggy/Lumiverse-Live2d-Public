@@ -28,7 +28,7 @@ import {
   sameColumns,
   sameStack,
 } from './columns';
-import { type HitAreaDef, detectHitAreaMeshes, hitAreaDefsFromBundle } from './hit-areas';
+import { type HitAreaDef, detectHitAreaMeshes, hitAreaDefsFromBundle, tappedArea } from './hit-areas';
 import { ensureLive2DRuntime } from './runtime';
 import { squareThumbnail, THUMBNAIL_RENDER_PIXELS } from './thumbnail';
 import {
@@ -55,6 +55,10 @@ const EXPRESSION_HOLD_MS = 5000;
 const THUMBNAIL_DELAY_MS = 1500;
 /** How long a tapped hit area stays highlighted while hit areas are shown. */
 const HIT_FLASH_MS = 600;
+/** A press through the chat on a background model is a tap if released this soon… */
+const TAP_MAX_MS = 500;
+/** …and this close to where it started (CSS px). */
+const TAP_SLOP_PX = 8;
 /** Smallest hit area that can be drawn, as a fraction of the model canvas's side. */
 const MIN_DRAWN_AREA = 0.01;
 /** Outline colors: hit areas from the model file, the user's own, and one being drawn. */
@@ -326,6 +330,12 @@ export class Stage {
   private drag: { entry: LoadedEntry; pointerId: number; offsetX: number; offsetY: number; moved: boolean } | null =
     null;
   private suppressClick = false;
+  /**
+   * A press on a background model through the chat (see SharedColumns.topmostAt):
+   * left to the chat, so it can still scroll or select text, and taken for a
+   * tap on the model if it's released soon, nearby, without selecting anything.
+   */
+  private pendingTap: { entry: LoadedEntry; pointerId: number; x: number; y: number; at: number } | null = null;
   /** Drawing a hit area on a model (Model settings > Hit areas > Add area / Redraw). */
   private drawing: {
     characterId: string;
@@ -333,7 +343,7 @@ export class Stage {
     press: { pointerId: number; start: { x: number; y: number }; current: { x: number; y: number } } | null;
   } | null = null;
   private hoverFrame: number | null = null;
-  private hovering = false;
+  private hovering: false | 'grab' | 'tap' = false;
 
   // The canvas never takes pointer events, so it can't block the chat UI drawn
   // under it. Model interaction is detected at the document level instead.
@@ -342,6 +352,7 @@ export class Stage {
     [document, 'pointermove', (event) => this.onPointerMove(event as PointerEvent), { capture: true }],
     [document, 'pointerup', (event) => this.onPointerUp(event as PointerEvent), { capture: true }],
     [document, 'pointercancel', () => this.endDrag(), { capture: true }],
+    [document, 'scroll', () => (this.pendingTap = null), { capture: true, passive: true }],
     [document, 'click', (event) => this.onClickCapture(event as MouseEvent), { capture: true }],
     [document, 'touchstart', (event) => this.capturing() && event.preventDefault(), { capture: true, passive: false }],
     [document, 'touchmove', (event) => this.capturing() && event.preventDefault(), { capture: true, passive: false }],
@@ -958,15 +969,24 @@ export class Stage {
    * canvas must be the topmost layer there (no drawer or modal above it), the
    * element underneath must not be a control (input, button, link…), and the
    * point must fall on one of a model's visible drawn parts. Where models
-   * overlap, the one drawn on top wins.
+   * overlap, the one drawn on top wins. `through`: a background model under
+   * an empty part of the chat, which can be tapped but not dragged.
    */
-  private modelAt(event: PointerEvent): LoadedEntry | null {
+  private modelAt(event: PointerEvent): { entry: LoadedEntry; through: boolean } | null {
     if (this.loaded.length === 0) return null;
     const target = event.target instanceof Element ? event.target : null;
     if (target?.closest(INTERACTIVE_SELECTOR)) return null;
     // Over the app, a Spine model may be drawn over ours: the topmost model wins.
     const hit = this.sharedColumns.topmostAt(event.clientX, event.clientY);
-    return hit?.extension === EXTENSION_ID ? (this.entryFor(hit.characterId) ?? null) : null;
+    const entry = hit?.extension === EXTENSION_ID ? this.entryFor(hit.characterId) : undefined;
+    return entry ? { entry, through: hit!.through } : null;
+  }
+
+  /** Whether a tap on a model at this stage point would play or send anything. */
+  private tapDoesSomething(entry: LoadedEntry, point: { x: number; y: number }): boolean {
+    const settings = this.storedSettings(entry);
+    if (!settings) return false;
+    return this.hitAreasAt(entry, point, settings).length > 0 || !isEmptyMapping(settings.animation_click);
   }
 
   private isOverModel(entry: LoadedEntry, point: { x: number; y: number }): boolean {
@@ -1014,8 +1034,14 @@ export class Stage {
       this.startDrawingPress(event);
       return;
     }
-    const entry = this.modelAt(event);
-    if (!entry) return;
+    const hit = this.modelAt(event);
+    if (!hit) return;
+    const { entry } = hit;
+    if (hit.through) {
+      // Through the chat (a background model): only a tap, and the chat keeps the press.
+      this.pendingTap = { entry, pointerId: event.pointerId, x: event.clientX, y: event.clientY, at: performance.now() };
+      return;
+    }
     event.preventDefault();
     event.stopPropagation();
     const point = this.toStagePoint(event);
@@ -1045,6 +1071,14 @@ export class Stage {
       this.dragTo(drag, event);
       return;
     }
+    const pending = this.pendingTap;
+    if (
+      pending &&
+      event.pointerId === pending.pointerId &&
+      Math.hypot(event.clientX - pending.x, event.clientY - pending.y) > TAP_SLOP_PX
+    ) {
+      this.pendingTap = null;
+    }
     if (this.loaded.length === 0) return;
     if (this.deps.getSettings().global.followCursor) {
       const rect = this.host?.getBoundingClientRect();
@@ -1065,7 +1099,11 @@ export class Stage {
           const entry = this.entryFor(this.drawing.characterId);
           this.setDrawCursor(!!entry && this.canvasReachableAt(entry, event) && this.onModelCanvas(entry, event));
         } else {
-          this.setHovering(this.modelAt(event) !== null);
+          const hit = this.modelAt(event);
+          if (!hit) this.setHovering(false);
+          else if (!hit.through) this.setHovering('grab');
+          // Through the chat a model can only be tapped: say so where a tap plays something.
+          else this.setHovering(this.tapDoesSomething(hit.entry, this.toStagePoint(event)) ? 'tap' : false);
         }
       });
     }
@@ -1100,6 +1138,20 @@ export class Stage {
       this.endDrag();
       return;
     }
+    const pending = this.pendingTap;
+    if (pending && event.pointerId === pending.pointerId) {
+      this.pendingTap = null;
+      const selection = window.getSelection();
+      if (
+        this.loaded.includes(pending.entry) &&
+        performance.now() - pending.at <= TAP_MAX_MS &&
+        Math.hypot(event.clientX - pending.x, event.clientY - pending.y) <= TAP_SLOP_PX &&
+        (!selection || selection.isCollapsed)
+      ) {
+        void this.onModelClick(pending.entry, event);
+      }
+      return;
+    }
     const drag = this.drag;
     if (!drag || event.pointerId !== drag.pointerId) return;
     event.preventDefault();
@@ -1110,6 +1162,7 @@ export class Stage {
 
   private endDrag(): void {
     this.drag = null;
+    this.pendingTap = null;
     // The browser dispatches `click` right after `pointerup`; if the pointer was
     // released over a different element no click comes, so stop suppressing.
     window.setTimeout(() => {
@@ -1124,10 +1177,11 @@ export class Stage {
     event.stopPropagation();
   }
 
-  private setHovering(hovering: boolean): void {
+  private setHovering(hovering: false | 'grab' | 'tap'): void {
     if (hovering === this.hovering) return;
     this.hovering = hovering;
-    document.documentElement.classList.toggle('live2d-avatars-hover', hovering);
+    document.documentElement.classList.toggle('live2d-avatars-hover', hovering === 'grab');
+    document.documentElement.classList.toggle('live2d-avatars-tap', hovering === 'tap');
   }
 
   private toStagePoint(event: { clientX: number; clientY: number }): { x: number; y: number } {
@@ -1466,6 +1520,24 @@ export class Stage {
 
   // ── Playback ──────────────────────────────────────────────────────────────
 
+  /**
+   * What an animation mapping plays once a tap in it ('tap:<area>', see
+   * tapMotion) is replaced by what that tap is set to: the tap's motion, and
+   * its expression unless the mapping has its own. The tapped area is
+   * highlighted, as for a real tap, while hit areas are shown. A tap never
+   * sends its message here.
+   */
+  expandTap(characterId: string, mapping: { expression: string; motion: string }): { expression: string; motion: string } {
+    const area = tappedArea(mapping.motion);
+    if (area === null) return mapping;
+    const entry = this.entryFor(characterId);
+    const settings = entry && this.storedSettings(entry);
+    const tap = area === '' ? settings?.animation_click : settings?.hit_areas[area];
+    if (entry && area !== '') entry.flash = { name: area, until: performance.now() + HIT_FLASH_MS };
+    const motion = tap?.motion && tappedArea(tap.motion) === null ? tap.motion : 'none';
+    return { expression: mapping.expression !== 'none' ? mapping.expression : (tap?.expression ?? 'none'), motion };
+  }
+
   async playExpression(characterId: string, expression: string): Promise<void> {
     const entry = this.entryFor(characterId);
     if (!entry || expression === 'none') return;
@@ -1479,6 +1551,7 @@ export class Stage {
   }
 
   async playMotion(characterId: string, motion: string, force = false): Promise<void> {
+    if (tappedArea(motion) !== null) motion = this.expandTap(characterId, { expression: 'none', motion }).motion;
     if (!this.entryFor(characterId) || motion === 'none') return;
     if (force || this.deps.getSettings().global.force_animation) {
       await this.reload();
@@ -1492,6 +1565,8 @@ export class Stage {
       if (id === undefined || id === 'random') await entry.model.motion(group);
       else await entry.model.motion(group, Number(id));
       entry.lastMotion = motion;
+      // For tests and debugging: the last motion started.
+      entry.canvas.dataset.live2dMotion = motion;
     } catch (error) {
       this.deps.log(`Motion "${motion}" failed: ${String(error)}`);
     }
