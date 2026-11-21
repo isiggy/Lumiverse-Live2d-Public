@@ -22,6 +22,10 @@
 //   lumiverse.sh e2e --hit-areas  # then draw a hit area on the model's face in Model settings, and
 //                                 # check taps on it play its motion (upright, rotated, after a reload)
 //                                 # while taps elsewhere fall back to On click
+//   lumiverse.sh e2e --hit-areas --background  # then also, with the model as the chat background:
+//                                 # taps through the empty chat reach the model, while a drag, a long
+//                                 # press, a message and the input don't; and an emotion set to a tap
+//                                 # plays that tap's motion
 //   (--model and --slow are handled by lumiverse.sh)
 
 import { createRequire } from 'node:module';
@@ -37,6 +41,7 @@ const testLibrary = process.argv.includes('--library');
 const group = process.argv.includes('--group');
 const stackOnly = process.argv.includes('--stack');
 const testHitAreas = process.argv.includes('--hit-areas');
+const testBackground = process.argv.includes('--background');
 // How long a model may take to appear: big models under swiftshader can take many minutes.
 const LOAD_TIMEOUT = Number(process.env.LUMI_LOAD_TIMEOUT_MS) || 180000;
 const lines = (value) => (value || '').split('\n').filter(Boolean);
@@ -957,6 +962,7 @@ async function stageCenter() {
 
 async function hitAreaTest(freshBinding) {
   console.log('Hit areas:');
+  await setBackgroundMode(false); // left on by an earlier --background run that failed
   let section = await openHitAreas();
   const text = await section.innerText();
   // The model file's areas are the rows before "Drawn on the model" that have no name field.
@@ -1063,6 +1069,115 @@ async function hitAreaTest(freshBinding) {
   const motion = await section.locator('.l2d-row:has(input.l2d-area-name)').first().locator('select').nth(1).inputValue();
   check(motion === chosenMotion, `after a reload the area keeps its motion (${motion})`);
   await page.keyboard.press('Escape');
+  return { headCenter, center, chosenMotion };
+}
+
+async function setBackgroundMode(on) {
+  await openLive2DTab();
+  const box = page.locator('label:has-text("Show model as chat background") input');
+  if ((await box.isChecked()) !== on) await box.click();
+  await page.waitForTimeout(1000);
+}
+
+/** Press, wait, move and release at a viewport point; returns whether the model counted a tap. */
+async function pressAt(x, y, { holdMs = 0, moveBy = 0 } = {}) {
+  const count = () => page.evaluate(() => Number(document.querySelector('.live2d-avatars-canvas')?.dataset.live2dTaps ?? 0));
+  const before = await count();
+  await page.mouse.move(x, y);
+  await page.mouse.down();
+  if (holdMs) await page.waitForTimeout(holdMs);
+  if (moveBy) await page.mouse.move(x + moveBy, y + moveBy, { steps: 6 });
+  await page.mouse.up();
+  await page.waitForTimeout(300);
+  return (await count()) > before;
+}
+
+/**
+ * With the model as the chat background, the chat is above it: taps must go
+ * through where the chat draws nothing, and only there, without taking the
+ * chat's presses (scrolling, selecting, its buttons and input).
+ */
+async function backgroundTapTest({ headCenter, center, chosenMotion }) {
+  console.log('Taps through the chat (background mode):');
+  await setBackgroundMode(true);
+  await reopenChat();
+  check(
+    await page.evaluate(() => !!document.querySelector('[data-lumiverse-avatar-layer="background"] .live2d-avatars-canvas')),
+    'the model is drawn as the chat background',
+  );
+  const chatAbove = (point) =>
+    page.evaluate(({ x, y }) => !!document.elementFromPoint(x, y)?.closest('[data-lumiverse-surface="chat-body"]'), point);
+  check(await chatAbove(headCenter), 'the chat is on top of the model’s face');
+  // Large models (baifeng_3) can still be setting up after the canvas appears.
+  await page
+    .waitForFunction(
+      ({ x, y }) => {
+        const canvas = document.querySelector('.live2d-avatars-canvas');
+        return !!canvas && !!window.__lumiverseAvatarColumns?.hitTests?.live2d_avatars?.(canvas, x, y);
+      },
+      headCenter,
+      { timeout: 60000 },
+    )
+    .catch(() => console.log('the model never answered a hit test at the face'));
+  check(
+    (await tapAt(headCenter.x, headCenter.y, `${OUT}/bg-1-tap-face-through-chat.png`)) === 'Face',
+    'a tap on the face through the empty chat hits the drawn area',
+  );
+  check((await tapAt(center.x, center.y + 50)) !== null, 'a tap on the body through the chat reaches the model');
+  check(!(await pressAt(headCenter.x, headCenter.y, { moveBy: 30 })), 'a drag through the chat is not a tap');
+  check(!(await pressAt(headCenter.x, headCenter.y, { holdMs: 800 })), 'a long press through the chat is not a tap');
+  const beside = { x: center.x - 500, y: center.y };
+  if (!(await drawnAt(beside.x, beside.y))) {
+    check((await tapAt(beside.x, beside.y)) === null, 'a tap through the chat beside the model is not a tap on it');
+  }
+
+  // A message over the model keeps the tap.
+  const onMessage = await page.evaluate(() => {
+    const canvas = document.querySelector('.live2d-avatars-canvas').getBoundingClientRect();
+    for (const card of document.querySelectorAll('[data-component="MinimalMessage"], [data-component="BubbleMessage"]')) {
+      const rect = card.getBoundingClientRect();
+      const x = Math.max(rect.left, canvas.left) + 40;
+      const y = (Math.max(rect.top, canvas.top) + Math.min(rect.bottom, canvas.bottom)) / 2;
+      if (x < Math.min(rect.right, canvas.right) && y > rect.top && y < rect.bottom) return { x, y };
+    }
+    return null;
+  });
+  if (onMessage) {
+    const message = { x: Math.max(onMessage.x, center.x - 60), y: onMessage.y };
+    check((await tapAt(message.x, message.y)) === null, 'a tap on a message over the model stays the message’s');
+  } else {
+    console.log('skip a tap on a message: no message over the model');
+  }
+
+  // The input bar keeps its clicks.
+  const input = page.locator('[data-component="InputArea"] textarea').first();
+  const inputBox = await input.boundingBox();
+  if (inputBox) {
+    const tapped = await pressAt(inputBox.x + inputBox.width / 2, inputBox.y + inputBox.height / 2);
+    const focused = await input.evaluate((node) => document.activeElement === node);
+    check(!tapped && focused, 'a click on the message input focuses it and is no tap');
+  }
+
+  // An emotion set to a tap plays that tap's motion (▶ in Emotion mappings).
+  await openLive2DTab();
+  const emotions = page.locator('.l2d-section:has(> .l2d-section-title:text-is("Emotion mappings"))');
+  await emotions.evaluate((node) => (node.open = true));
+  const joy = emotions.locator('.l2d-row:has(> span.l2d-emotion:text-is("joy"))');
+  const joyMotion = joy.locator('select').nth(1);
+  const tapOptions = await joyMotion.locator('optgroup[label^="Taps"] option').evaluateAll((nodes) =>
+    nodes.map((node) => node.value),
+  );
+  check(tapOptions.includes('tap:Face'), `Emotion mappings offer the model’s taps (${tapOptions.join(', ')})`);
+  await joyMotion.selectOption('tap:Face');
+  await page.waitForTimeout(800);
+  await joy.locator('button:text-is("▶")').click();
+  await page.waitForTimeout(3000);
+  const played = await page.evaluate(() => document.querySelector('.live2d-avatars-canvas')?.dataset.live2dMotion ?? null);
+  check(played === chosenMotion, `an emotion set to “Tap Face” plays Face’s motion (${played})`);
+  await page.screenshot({ path: `${OUT}/bg-2-emotion-tap.png` });
+  await joyMotion.selectOption('none');
+  await page.waitForTimeout(800);
+  await setBackgroundMode(false);
 }
 
 try {
@@ -1134,7 +1249,10 @@ try {
     console.log('OK: avatar overlay is on screen');
   }
   if (testLibrary && stage) await libraryTest();
-  if (testHitAreas && stage) await hitAreaTest(binding.startsWith('bound'));
+  if (testHitAreas && stage) {
+    const areas = await hitAreaTest(binding.startsWith('bound'));
+    if (testBackground) await backgroundTapTest(areas);
+  }
 } finally {
   await browser.close();
 }
