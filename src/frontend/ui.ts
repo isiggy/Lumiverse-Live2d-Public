@@ -11,6 +11,7 @@ import type { ModelDescription, Stage } from './stage';
 import {
   CLASSIFY_EXPRESSIONS,
   CURSOR_PARAM_IDS,
+  defaultModelSettings,
   type LibrarySort,
   type CustomHitArea,
   type LibraryView,
@@ -50,6 +51,8 @@ export interface UIController {
   importModelSettings(characterId: string, characterName: string): Promise<string>;
   /** Retake the library thumbnail of a character's model on stage; false when it isn't shown. */
   updateThumbnail(characterId: string, modelId: string): boolean;
+  /** Ask before something that can't be undone; resolves to whether the user agreed. */
+  confirm(options: { title: string; message: string; confirmLabel: string }): Promise<boolean>;
 }
 
 const REQUIRED_PERMS: Array<{ id: string; why: string }> = [
@@ -80,14 +83,32 @@ function button(label: string, onClick: () => void): HTMLButtonElement {
   return node;
 }
 
-function checkbox(label: string, checked: boolean, onChange: (value: boolean) => void): HTMLLabelElement {
+/** A small square button (▶, ✕, ↺) that names its action for screen readers and on hover. */
+function iconButton(icon: string, label: string, onClick: () => void): HTMLButtonElement {
+  const node = button(icon, onClick);
+  node.classList.add('l2d-icon-btn');
+  node.title = label;
+  node.setAttribute('aria-label', label);
+  return node;
+}
+
+/** A checkbox, with an optional line under its label that says what it does. */
+function checkbox(
+  label: string,
+  checked: boolean,
+  onChange: (value: boolean) => void,
+  hint?: string,
+): HTMLLabelElement {
   const wrap = el('label', 'l2d-check');
   const input = el('input');
   input.type = 'checkbox';
   input.checked = checked;
   input.addEventListener('change', () => onChange(input.checked));
   wrap.appendChild(input);
-  wrap.appendChild(el('span', undefined, label));
+  const text = el('span', 'l2d-check-text');
+  text.appendChild(el('span', undefined, label));
+  if (hint) text.appendChild(el('span', 'l2d-hint', hint));
+  wrap.appendChild(text);
   return wrap;
 }
 
@@ -108,49 +129,125 @@ function select(
   return node;
 }
 
+interface SliderOptions {
+  min: number;
+  max: number;
+  step: number;
+  /** Shown after the value: '%', '°', '×', 'ms'. */
+  unit?: string;
+  /** The default value; a reset button shows whenever the value differs from it. */
+  reset?: number;
+}
+
+/**
+ * A labelled slider whose value can also be typed in, with a reset button
+ * once it's moved off its default. The range input carries the label as its
+ * aria-label.
+ */
 function slider(
   label: string,
-  min: number,
-  max: number,
-  step: number,
+  options: SliderOptions,
   value: number,
   onInput: (value: number) => void,
 ): HTMLDivElement & { setValue(value: number): void } {
+  const decimals = (String(options.step).split('.')[1] ?? '').length;
+  const clamp = (next: number) =>
+    Number(Math.min(options.max, Math.max(options.min, next)).toFixed(decimals));
+  const range = el('input', 'l2d-range');
+  range.type = 'range';
+  range.min = String(options.min);
+  range.max = String(options.max);
+  range.step = String(options.step);
+  range.setAttribute('aria-label', label);
+  const number = el('input', 'l2d-number');
+  number.type = 'number';
+  number.min = String(options.min);
+  number.max = String(options.max);
+  number.step = String(options.step);
+  number.setAttribute('aria-label', `${label} value`);
+  const reset =
+    options.reset === undefined
+      ? null
+      : iconButton('↺', `Reset to ${options.reset}${options.unit ?? ''}`, () => {
+          show(options.reset!);
+          onInput(options.reset!);
+        });
+  const show = (next: number) => {
+    range.value = String(next);
+    number.value = next.toFixed(decimals);
+    const fill = ((next - options.min) / (options.max - options.min)) * 100;
+    range.style.setProperty('--l2d-fill', `${Math.min(100, Math.max(0, fill))}%`);
+    if (reset) reset.hidden = next === options.reset;
+  };
+  range.addEventListener('input', () => {
+    const next = clamp(Number(range.value));
+    show(next);
+    onInput(next);
+  });
+  number.addEventListener('change', () => {
+    const typed = Number(number.value);
+    const next = number.value.trim() === '' || !Number.isFinite(typed) ? Number(range.value) : clamp(typed);
+    show(next);
+    onInput(next);
+  });
+  const head = el('div', 'l2d-slider-head');
+  head.appendChild(el('span', 'l2d-slider-label', label));
+  const valueBox = el('span', 'l2d-slider-value');
+  valueBox.appendChild(number);
+  if (options.unit) valueBox.appendChild(el('span', 'l2d-unit', options.unit));
+  if (reset) valueBox.appendChild(reset);
+  head.appendChild(valueBox);
   const wrap = Object.assign(el('div', 'l2d-slider'), {
     /** Show a value set from code, without calling onInput. */
     setValue(next: number) {
-      input.value = String(next);
-      valueSpan.textContent = input.value;
+      show(next);
     },
   });
-  const head = el('div', 'l2d-slider-head');
-  head.appendChild(el('span', undefined, label));
-  const valueSpan = el('span', 'l2d-slider-value', String(value));
-  head.appendChild(valueSpan);
-  const input = el('input');
-  input.type = 'range';
-  input.min = String(min);
-  input.max = String(max);
-  input.step = String(step);
-  input.value = String(value);
-  input.addEventListener('input', () => {
-    valueSpan.textContent = input.value;
-    onInput(Number(input.value));
-  });
-  wrap.appendChild(head);
-  wrap.appendChild(input);
+  wrap.append(head, range);
+  show(value);
   return wrap;
 }
 
-function section(title: string, ...children: (HTMLElement | null)[]): HTMLElement {
-  const wrap = el('details', 'l2d-section') as unknown as HTMLDetailsElement;
-  wrap.open = true;
-  const summary = el('summary', 'l2d-section-title', title);
-  wrap.appendChild(summary);
+// Which sections are open is remembered in this browser, by title, so a
+// re-render (or a reload) doesn't open everything again.
+const SECTION_STATE_KEY = 'live2d-avatars:open-sections';
+
+function loadSectionState(): Record<string, boolean> {
+  try {
+    const parsed: unknown = JSON.parse(localStorage.getItem(SECTION_STATE_KEY) ?? '{}');
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, boolean>) : {};
+  } catch {
+    return {};
+  }
+}
+
+const sectionState = loadSectionState();
+
+/** A collapsible section, open unless `open: false`; the user's choice is remembered. */
+function section(
+  title: string,
+  children: (HTMLElement | null)[] = [],
+  options: { open?: boolean; className?: string } = {},
+): HTMLDetailsElement {
+  const wrap = el('details', 'l2d-section');
+  if (options.className) wrap.classList.add(options.className);
+  const defaultOpen = options.open ?? true;
+  wrap.open = sectionState[title] ?? defaultOpen;
+  wrap.addEventListener('toggle', () => {
+    if (wrap.open === (sectionState[title] ?? defaultOpen)) return;
+    sectionState[title] = wrap.open;
+    try {
+      localStorage.setItem(SECTION_STATE_KEY, JSON.stringify(sectionState));
+    } catch {
+      /* storage unavailable: it's only remembered until the tab reloads */
+    }
+  });
+  wrap.appendChild(el('summary', 'l2d-section-title', title));
   for (const child of children) if (child) wrap.appendChild(child);
   return wrap;
 }
 
+/** A row of buttons and status text. */
 function row(...children: (HTMLElement | string)[]): HTMLDivElement {
   const wrap = el('div', 'l2d-row');
   for (const child of children) {
@@ -159,8 +256,35 @@ function row(...children: (HTMLElement | string)[]): HTMLDivElement {
   return wrap;
 }
 
+/** A label and its control(s), lined up with the other fields; selects and inputs fill the space. */
+function field(label: string, ...controls: HTMLElement[]): HTMLDivElement {
+  const wrap = el('div', 'l2d-field');
+  wrap.appendChild(el('span', 'l2d-label', label));
+  const box = el('div', 'l2d-field-control');
+  for (const control of controls) {
+    if ((control instanceof HTMLSelectElement || control instanceof HTMLInputElement) && !control.hasAttribute('aria-label')) {
+      control.setAttribute('aria-label', label);
+    }
+    box.appendChild(control);
+  }
+  wrap.appendChild(box);
+  return wrap;
+}
+
 function note(text: string): HTMLParagraphElement {
   return el('p', 'l2d-note', text);
+}
+
+/** A line that explains why a button didn't do anything; empty otherwise. */
+function statusLine(): { root: HTMLSpanElement; say(text: string): void } {
+  const root = el('span', 'l2d-dim', '');
+  root.setAttribute('role', 'status');
+  return {
+    root,
+    say(text: string) {
+      root.textContent = text;
+    },
+  };
 }
 
 // ── model library helpers ───────────────────────────────────────────────────
@@ -280,8 +404,6 @@ export class SettingsUI {
   private mounted: SpindleSelectHandle[] = [];
   /** Host dropdowns to mount once the render has put their placeholders in the tab. */
   private pendingMounts: Array<() => void> = [];
-  /** Whether Model settings' Hit areas section is open, kept across renders. */
-  private hitAreasOpen = false;
 
   constructor(private controller: UIController) {}
 
@@ -290,12 +412,12 @@ export class SettingsUI {
     this.render();
   }
 
-  /** Re-render from current state (cheap enough for a settings panel). */
   /** The stage moved a model (drag); show the new position on the sliders. */
   layoutChanged(): void {
     this.syncLayout?.();
   }
 
+  /** Re-render from current state (cheap enough for a settings panel). */
   render(): void {
     const root = this.root;
     if (!root) return;
@@ -334,27 +456,41 @@ export class SettingsUI {
 
     // ── Global settings ──
     root.appendChild(
-      section(
-        'Global',
+      section('Global', [
         checkbox('Enabled', globals.enabled, (value) => {
           globals.enabled = value;
           controller.saveNow();
           controller.reloadStage();
         }),
-        checkbox('Follow cursor', globals.followCursor, (value) => {
-          globals.followCursor = value;
-          controller.saveDebounced();
-        }),
-        checkbox('Show model as chat background', globals.backgroundMode, (value) => {
-          globals.backgroundMode = value;
-          controller.saveNow();
-          controller.applyBackgroundMode();
-        }),
-        checkbox('Auto-send interaction', globals.autoSendInteraction, (value) => {
-          globals.autoSendInteraction = value;
-          controller.saveDebounced();
-        }),
-        row(
+        checkbox(
+          'Show model as chat background',
+          globals.backgroundMode,
+          (value) => {
+            globals.backgroundMode = value;
+            controller.saveNow();
+            controller.applyBackgroundMode();
+          },
+          'Draw the model behind the chat messages instead of over them.',
+        ),
+        checkbox(
+          'Follow cursor',
+          globals.followCursor,
+          (value) => {
+            globals.followCursor = value;
+            controller.saveDebounced();
+          },
+          'The model looks toward the mouse pointer.',
+        ),
+        checkbox(
+          'Reply to click messages',
+          globals.autoSendInteraction,
+          (value) => {
+            globals.autoSendInteraction = value;
+            controller.saveDebounced();
+          },
+          'When a click or hit area posts its message, the character answers it right away.',
+        ),
+        field(
           'Emotion detection',
           select(
             [
@@ -369,102 +505,21 @@ export class SettingsUI {
             },
           ),
         ),
+        note('Each new character message plays the animation mapped to its emotion (Model settings → Emotion mappings).'),
         controller.usingOverlay()
           ? null
           : note('Overlay permission not granted — the avatar renders in the preview box below.'),
-      ),
-    );
-
-    // ── Debug ──
-    root.appendChild(
-      section(
-        'Debug',
-        checkbox('Reset model before animations (force animation)', globals.force_animation, (value) => {
-          globals.force_animation = value;
-          controller.saveDebounced();
-        }),
-        checkbox('Force animations to loop', globals.force_loop, (value) => {
-          globals.force_loop = value;
-          controller.saveDebounced();
-        }),
-        checkbox('Show model frames & hit areas', globals.showFrames, (value) => {
-          globals.showFrames = value;
-          controller.saveDebounced();
-          controller.stage.setShowFrames(value);
-        }),
-        row(
-          button('Reload Live2D', () => controller.reloadStage()),
-        ),
-      ),
+      ]),
     );
 
     // ── Embedded preview host ──
     if (!controller.usingOverlay()) {
-      const preview = section('Stage preview');
       controller.embeddedHost.classList.add('l2d-embedded-host');
-      preview.appendChild(controller.embeddedHost);
-      root.appendChild(preview);
+      root.appendChild(section('Stage preview', [controller.embeddedHost]));
     }
-
-    // ── Model library ──
-    const models = controller.getModels();
-    const library = el('div');
-    const libraryList = el('div');
-    this.libraryList = libraryList;
-    if (models.length === 0) {
-      library.appendChild(note('No models imported yet. Import a Live2D model folder as a .zip archive.'));
-    } else {
-      const filter = el('input', 'l2d-input l2d-library-filter');
-      filter.type = 'search';
-      filter.placeholder = 'Filter models…';
-      filter.value = this.libraryFilter;
-      filter.addEventListener('input', () => {
-        this.libraryFilter = filter.value;
-        this.renderLibraryList(libraryList);
-      });
-      const sort = select(SORT_OPTIONS, globals.librarySort, (value) => {
-        globals.librarySort = value as LibrarySort;
-        controller.saveDebounced();
-        this.renderLibraryList(libraryList);
-      });
-      sort.title = 'Sort models';
-      const views = el('div', 'l2d-segmented');
-      const viewButtons = (['tiles', 'list'] as const).map((view) => {
-        const viewButton = button(view === 'tiles' ? 'Tiles' : 'List', () => {
-          globals.libraryView = view;
-          controller.saveDebounced();
-          for (const other of viewButtons) other.classList.toggle('l2d-active', other === viewButton);
-          this.renderLibraryList(libraryList);
-        });
-        viewButton.classList.toggle('l2d-active', libraryView(globals.libraryView) === view);
-        views.appendChild(viewButton);
-        return viewButton;
-      });
-      library.appendChild(row(filter, sort, views));
-    }
-    library.appendChild(libraryList);
-    this.renderLibraryList(libraryList);
-    const importStatus = el('span', 'l2d-dim', '');
-    library.appendChild(
-      row(
-        button('Import model (.zip)', () => {
-          void this.controller.importZip((text) => {
-            importStatus.textContent = text;
-          });
-        }),
-        importStatus,
-      ),
-    );
-    library.appendChild(
-      note(
-        'Zip the model folder (the *.model3.json or *.model.json file plus textures, motions and expressions). ' +
-          'A sillytavern_settings.json preset in the folder is applied automatically. ' +
-          "A model's thumbnail is taken the first time it's shown.",
-      ),
-    );
-    root.appendChild(section('Model library', library));
 
     // ── Character binding ──
+    const models = controller.getModels();
     const known = controller.getCharacters();
     const activeCharacterId = controller.getActiveCharacterId();
     // The chat's characters come first, marked, in member order.
@@ -539,15 +594,18 @@ export class SettingsUI {
         },
         { placeholder: 'No model', searchPlaceholder: 'Search models…', noneLabel: 'No model' },
       );
-      bindingSection.appendChild(row('Character', characterSelect));
-      bindingSection.appendChild(row('Model', modelSelect));
+      bindingSection.appendChild(field('Character', characterSelect));
+      bindingSection.appendChild(field('Model', modelSelect));
+      if (models.length === 0) {
+        bindingSection.appendChild(note('Your library is empty: import a model in Model library below first.'));
+      }
       if (isGroup) {
         bindingSection.appendChild(
           note(
-            'Group chat: every member with a model is shown. The stage is split into equal columns, one per ' +
-              'member with a model (Live2D or, with the Spine Avatars extension, Spine), in member order. ' +
-              'Scale 1 fits the model in its column; X and Y offset and Fit to canvas work within that column. ' +
-              'Where models overlap, Send to front and Send to back in Model settings choose which one is drawn on top.',
+            'Group chat: every member with a model is shown, side by side in equal columns in member order ' +
+              '(Live2D and, with the Spine Avatars extension, Spine models). Zoom 1 fits the model in its column, ' +
+              'and X and Y offset and Fit to canvas work within that column. Where models overlap, Send to front and ' +
+              'Send to back in Model settings choose which one is drawn on top.',
           ),
         );
       }
@@ -555,6 +613,7 @@ export class SettingsUI {
         characters.find((character) => character.id === this.selectedCharacterId)?.name.replace(/ \(in this chat\)$/, '') ??
         'Character';
       const fileStatus = el('span', 'l2d-dim', this.fileStatusText);
+      fileStatus.setAttribute('role', 'status');
       const exportButton = button('Export settings', () => {
         if (this.selectedCharacterId) controller.exportModelSettings(this.selectedCharacterId, characterName());
       });
@@ -574,28 +633,37 @@ export class SettingsUI {
           });
       });
       importButton.title = 'Load model and animation settings for this character from a file';
-      bindingSection.appendChild(row(exportButton, importButton, fileStatus));
-      bindingSection.appendChild(
-        row(
-          button('Clear model settings for this character', () => {
-            const characterId = this.selectedCharacterId;
-            if (!characterId) return;
+      const resetButton = button('Reset settings', () => {
+        const characterId = this.selectedCharacterId;
+        if (!characterId) return;
+        void controller
+          .confirm({
+            title: 'Reset model settings',
+            message:
+              `Reset ${characterName()}’s settings for every model to the defaults? Position, zoom, ` +
+              'animations, emotion mappings and hit areas are all cleared. The model stays assigned.',
+            confirmLabel: 'Reset',
+          })
+          .then((confirmed) => {
+            if (!confirmed) return;
             delete settings.characterModelsSettings[characterId];
             controller.saveNow();
             if (this.isOnStage(characterId)) controller.reloadStage();
             this.render();
-          }),
-        ),
-      );
+          });
+      });
+      resetButton.classList.add('l2d-btn-danger');
+      resetButton.title = 'Clear this character’s model settings back to the defaults';
+      bindingSection.appendChild(row(exportButton, importButton, resetButton, fileStatus));
     }
-    root.appendChild(section('Character model', bindingSection));
+    root.appendChild(section('Character model', [bindingSection]));
 
     // ── Per-model settings (async: needs the model description) ──
     if (this.selectedCharacterId && this.selectedModelId) {
       const host = el('div');
       const status = note('Loading model details…');
       host.appendChild(status);
-      root.appendChild(section('Model settings', host));
+      root.appendChild(section('Model settings', [host]));
       const characterId = this.selectedCharacterId;
       const modelId = this.selectedModelId;
       const showProgress = () => {
@@ -625,29 +693,136 @@ export class SettingsUI {
         .finally(() => window.clearInterval(progressTimer));
     }
 
+    // ── Model library ──
+    const library = el('div');
+    const libraryList = el('div');
+    this.libraryList = libraryList;
+    const importStatus = el('span', 'l2d-dim', '');
+    importStatus.setAttribute('role', 'status');
+    const importButton = button('Import model (.zip)', () => {
+      void this.controller.importZip((text) => {
+        importStatus.textContent = text;
+      });
+    });
+    importButton.classList.add('l2d-btn-primary');
+    importButton.title =
+      'Zip the model folder: the *.model3.json or *.model.json file plus its textures, motions and expressions';
+    library.appendChild(row(importButton, importStatus));
+    if (models.length === 0) {
+      library.appendChild(
+        note(
+          'No models yet. Zip a Live2D model folder (the *.model3.json or *.model.json file plus textures, ' +
+            'motions and expressions) and import it.',
+        ),
+      );
+    } else {
+      const filter = el('input', 'l2d-input l2d-library-filter');
+      filter.type = 'search';
+      filter.placeholder = 'Filter models…';
+      filter.setAttribute('aria-label', 'Filter models');
+      filter.value = this.libraryFilter;
+      filter.addEventListener('input', () => {
+        this.libraryFilter = filter.value;
+        this.renderLibraryList(libraryList);
+      });
+      const sort = select(SORT_OPTIONS, globals.librarySort, (value) => {
+        globals.librarySort = value as LibrarySort;
+        controller.saveDebounced();
+        this.renderLibraryList(libraryList);
+      });
+      sort.title = 'Sort models';
+      sort.setAttribute('aria-label', 'Sort models');
+      const views = el('div', 'l2d-segmented');
+      views.setAttribute('role', 'group');
+      views.setAttribute('aria-label', 'Library view');
+      const viewButtons = (['tiles', 'list'] as const).map((view) => {
+        const viewButton = button(view === 'tiles' ? 'Tiles' : 'List', () => {
+          globals.libraryView = view;
+          controller.saveDebounced();
+          for (const other of viewButtons) {
+            other.classList.toggle('l2d-active', other === viewButton);
+            other.setAttribute('aria-pressed', String(other === viewButton));
+          }
+          this.renderLibraryList(libraryList);
+        });
+        const active = libraryView(globals.libraryView) === view;
+        viewButton.classList.toggle('l2d-active', active);
+        viewButton.setAttribute('aria-pressed', String(active));
+        views.appendChild(viewButton);
+        return viewButton;
+      });
+      library.appendChild(row(filter, sort, views));
+    }
+    library.appendChild(libraryList);
+    this.renderLibraryList(libraryList);
+    if (models.length > 0) {
+      library.appendChild(
+        note(
+          'A sillytavern_settings.json preset in a model’s folder is applied automatically. ' +
+            'A model’s thumbnail is taken the first time it’s shown; the highlighted one is the selected character’s.',
+        ),
+      );
+    }
+    root.appendChild(section('Model library', [library]));
+
     // ── Classification test ──
     const testInput = el('input', 'l2d-input') as HTMLInputElement;
     testInput.type = 'text';
     testInput.placeholder = 'Type a message to classify…';
+    testInput.setAttribute('aria-label', 'Message to classify');
     const testResult = el('span', 'l2d-dim', '');
+    testResult.setAttribute('role', 'status');
+    const classifyButton = button('Classify', () => {
+      if (!testInput.value.trim()) {
+        testResult.textContent = 'Type a message first.';
+        return;
+      }
+      testResult.textContent = 'Classifying…';
+      classifyButton.disabled = true;
+      void controller
+        .classifyTest(testInput.value)
+        .then((label) => {
+          testResult.textContent = `Emotion: ${label}`;
+        })
+        .catch((error) => {
+          testResult.textContent = String(error);
+        })
+        .finally(() => {
+          classifyButton.disabled = false;
+        });
+    });
+    testInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') classifyButton.click();
+    });
     root.appendChild(
       section(
         'Test emotion classification',
-        row(
-          testInput,
-          button('Classify', () => {
-            testResult.textContent = '…';
-            void controller
-              .classifyTest(testInput.value)
-              .then((label) => {
-                testResult.textContent = `→ ${label}`;
-              })
-              .catch((error) => {
-                testResult.textContent = String(error);
-              });
+        [row(testInput, classifyButton), testResult],
+        { open: false },
+      ),
+    );
+
+    // ── Debug ──
+    root.appendChild(
+      section(
+        'Debug',
+        [
+          checkbox('Reset model before animations (force animation)', globals.force_animation, (value) => {
+            globals.force_animation = value;
+            controller.saveDebounced();
           }),
-          testResult,
-        ),
+          checkbox('Force animations to loop', globals.force_loop, (value) => {
+            globals.force_loop = value;
+            controller.saveDebounced();
+          }),
+          checkbox('Show model frames & hit areas', globals.showFrames, (value) => {
+            globals.showFrames = value;
+            controller.saveDebounced();
+            controller.stage.setShowFrames(value);
+          }),
+          row(button('Reload Live2D', () => controller.reloadStage())),
+        ],
+        { open: false },
       ),
     );
 
@@ -677,10 +852,13 @@ export class SettingsUI {
     }
     const boundTo = (modelId: string) =>
       Object.values(settings.characterModelMapping).filter((bound) => bound === modelId).length;
+    const usedBy = (count: number) => (count ? `used by ${count}` : 'unused');
+    const current = this.selectedCharacterId ? settings.characterModelMapping[this.selectedCharacterId] : undefined;
     const remove = (model: ModelRecord, label: string) => {
       const removeButton = button(label, () => {
         void controller.deleteModel(model.id);
       });
+      removeButton.classList.add('l2d-btn-danger');
       removeButton.title = `Delete ${model.name}`;
       removeButton.setAttribute('aria-label', `Delete ${model.name}`);
       return removeButton;
@@ -690,11 +868,13 @@ export class SettingsUI {
       const grid = el('div', 'l2d-tiles');
       for (const model of shown) {
         const tile = el('div', 'l2d-tile');
+        tile.dataset.modelId = model.id;
+        tile.classList.toggle('l2d-current', model.id === current);
         const used = boundTo(model.id);
         tile.title = `${model.name}\n${modelSummary(model)}${used ? `\nUsed by ${used} character${used === 1 ? '' : 's'}` : ''}`;
         tile.appendChild(thumbnail(model, 'l2d-tile-thumb'));
         tile.appendChild(el('div', 'l2d-tile-name', model.name));
-        tile.appendChild(el('div', 'l2d-tile-meta', `${(model.sizeBytes / (1024 * 1024)).toFixed(1)} MB`));
+        tile.appendChild(el('div', 'l2d-tile-meta', `${(model.sizeBytes / (1024 * 1024)).toFixed(1)} MB · ${usedBy(used)}`));
         const removeButton = remove(model, '✕');
         removeButton.classList.add('l2d-tile-delete');
         tile.appendChild(removeButton);
@@ -706,9 +886,13 @@ export class SettingsUI {
     for (const model of shown) {
       const megabytes = (model.sizeBytes / (1024 * 1024)).toFixed(1);
       const line = el('div', 'l2d-list-row');
+      line.dataset.modelId = model.id;
+      line.classList.toggle('l2d-current', model.id === current);
       const text = el('div', 'l2d-list-text');
       text.appendChild(el('div', 'l2d-model-name', model.name));
-      text.appendChild(el('div', 'l2d-dim', `Cubism ${model.cubism} · ${model.fileCount} files · ${megabytes} MB`));
+      text.appendChild(
+        el('div', 'l2d-dim', `Cubism ${model.cubism} · ${model.fileCount} files · ${megabytes} MB · ${usedBy(boundTo(model.id))}`),
+      );
       line.append(thumbnail(model, 'l2d-list-thumb'), text, remove(model, 'Delete'));
       host.appendChild(line);
     }
@@ -770,30 +954,52 @@ export class SettingsUI {
     description: ModelDescription,
   ): void {
     const controller = this.controller;
+    const stage = controller.stage;
     const modelSettings = controller.getOrCreateModelSettings(characterId, modelId, description);
+    const defaults = defaultModelSettings();
+    const changed = () => controller.saveDebounced();
 
     const applyLive = () => {
-      if (controller.stage.isOnStage(characterId, modelId)) controller.stage.applyLayoutFor(characterId);
+      if (stage.isOnStage(characterId, modelId)) stage.applyLayoutFor(characterId);
     };
-    const play = (mapping: { expression: string; motion: string }) => {
-      void controller.stage.playExpression(characterId, mapping.expression);
-      void controller.stage.playMotion(characterId, mapping.motion, true);
+    /** Why buttons that act on the stage can't, or null when the model is on stage. */
+    const notLiveReason = (): string | null => {
+      if (stage.isOnStage(characterId, modelId)) return null;
+      if (!controller.getSettings().global.enabled) return 'Live2D is turned off (Global → Enabled).';
+      if (!this.isOnStage(characterId)) return 'Open a chat with this character to see the model on stage.';
+      return "The model isn't on stage yet. If it doesn't appear, use Debug → Reload Live2D.";
     };
+    /** Run `action` on the live model, or explain on `status` why it can't. */
+    const onStage = (status: { say(text: string): void }, action: () => void) => {
+      const reason = notLiveReason();
+      status.say(reason ?? '');
+      if (!reason) action();
+    };
+    const play = (status: { say(text: string): void }, mapping: { expression: string; motion: string }) =>
+      onStage(status, () => {
+        void stage.playExpression(characterId, mapping.expression);
+        void stage.playMotion(characterId, mapping.motion, true);
+      });
 
-    // Layout sliders
-    const scaleSlider = slider('Scale', 0.05, 3, 0.01, modelSettings.scale, (value) => {
+    // ── View ──
+    const scaleSlider = slider('Zoom', { min: 0.05, max: 3, step: 0.01, unit: '×', reset: defaults.scale }, modelSettings.scale, (value) => {
       modelSettings.scale = value;
-      controller.saveDebounced();
+      changed();
       applyLive();
     });
-    const xSlider = slider('X offset (%)', -100, 100, 1, modelSettings.x, (value) => {
+    const xSlider = slider('X offset', { min: -100, max: 100, step: 1, unit: '%', reset: 0 }, modelSettings.x, (value) => {
       modelSettings.x = value;
-      controller.saveDebounced();
+      changed();
       applyLive();
     });
-    const ySlider = slider('Y offset (%)', -100, 100, 1, modelSettings.y, (value) => {
+    const ySlider = slider('Y offset', { min: -100, max: 100, step: 1, unit: '%', reset: 0 }, modelSettings.y, (value) => {
       modelSettings.y = value;
-      controller.saveDebounced();
+      changed();
+      applyLive();
+    });
+    const rotationSlider = slider('Rotation', { min: -180, max: 180, step: 1, unit: '°', reset: 0 }, modelSettings.rotation, (value) => {
+      modelSettings.rotation = value;
+      changed();
       applyLive();
     });
     this.syncLayout = () => {
@@ -807,183 +1013,222 @@ export class SettingsUI {
       xSlider.setValue(0);
       ySlider.setValue(0);
     };
-    const fitHint = el('span', 'l2d-dim', '');
-    host.appendChild(
-      row(
-        button('Fit to canvas', () => {
-          const fit = controller.stage.fitScale(characterId, modelId, modelSettings.rotation || 0);
-          if (fit === null) {
-            fitHint.textContent = 'Show the model first, then try again.';
-            return;
-          }
-          fitHint.textContent = '';
-          // Round down so the rounded scale still fits.
-          modelSettings.scale = Math.min(3, Math.max(0.05, Math.floor(fit * 100) / 100));
-          scaleSlider.setValue(modelSettings.scale);
-          center();
-          controller.saveDebounced();
-          applyLive();
-        }),
-        button('Center model', () => {
-          center();
-          controller.saveDebounced();
-          applyLive();
-        }),
-        button('Update thumbnail', () => {
-          fitHint.textContent = controller.updateThumbnail(characterId, modelId)
-            ? 'Thumbnail updated.'
-            : 'Show the model first, then try again.';
-        }),
-        fitHint,
-      ),
+    const viewStatus = statusLine();
+    const view = el('div');
+    const fitButton = button('Fit to canvas', () =>
+      onStage(viewStatus, () => {
+        const fit = stage.fitScale(characterId, modelId, modelSettings.rotation || 0);
+        if (fit === null) {
+          viewStatus.say('The stage is hidden or has no size yet. Show it, then try again.');
+          return;
+        }
+        // Round down so the rounded scale still fits.
+        modelSettings.scale = Math.min(3, Math.max(0.05, Math.floor(fit * 100) / 100));
+        scaleSlider.setValue(modelSettings.scale);
+        center();
+        changed();
+        applyLive();
+      }),
     );
-    if (controller.stage.getChatContext().characterIds.length > 1 && this.isOnStage(characterId)) {
+    fitButton.title = 'Make the model as large as fits, at its current rotation, and center it';
+    const centerButton = button('Center model', () => {
+      center();
+      viewStatus.say('');
+      changed();
+      applyLive();
+    });
+    centerButton.title = 'Set X and Y offset back to 0';
+    const thumbButton = button('Update thumbnail', () =>
+      onStage(viewStatus, () => {
+        viewStatus.say(
+          controller.updateThumbnail(characterId, modelId)
+            ? 'Thumbnail updated.'
+            : 'The stage is hidden or has no size yet. Show it, then try again.',
+        );
+      }),
+    );
+    thumbButton.title = 'Take the library thumbnail again from the model as it is now';
+    view.appendChild(row(fitButton, centerButton, thumbButton));
+    if (stage.getChatContext().characterIds.length > 1 && this.isOnStage(characterId)) {
       // Where models overlap in a group chat, Live2D or Spine.
-      const stackHint = el('span', 'l2d-dim', '');
-      const restack = (toFront: boolean) => {
-        if (controller.stage.restack(characterId, toFront)) stackHint.textContent = '';
-        else if (!controller.stage.isOnStage(characterId, modelId)) stackHint.textContent = 'Show the model first, then try again.';
-        else stackHint.textContent = toFront ? 'Already in front.' : 'Already at the back.';
-      };
+      const restack = (toFront: boolean) =>
+        onStage(viewStatus, () => {
+          if (!stage.restack(characterId, toFront)) viewStatus.say(toFront ? 'Already in front.' : 'Already at the back.');
+        });
       const front = button('Send to front', () => restack(true));
       front.title = 'Draw this model over the other models in the chat where they overlap';
       const back = button('Send to back', () => restack(false));
       back.title = 'Draw this model under the other models in the chat where they overlap';
-      host.appendChild(row(front, back, stackHint));
+      view.appendChild(row(front, back));
     }
-    host.appendChild(scaleSlider);
-    host.appendChild(xSlider);
-    host.appendChild(ySlider);
-    host.appendChild(
-      slider('Rotation (°)', -180, 180, 1, modelSettings.rotation, (value) => {
-        modelSettings.rotation = value;
-        controller.saveDebounced();
-        applyLive();
-      }),
+    view.appendChild(viewStatus.root);
+    view.append(scaleSlider, xSlider, ySlider, rotationSlider);
+    view.appendChild(
+      checkbox(
+        'Hide anything outside the model canvas',
+        modelSettings.clip_to_canvas,
+        (value) => {
+          modelSettings.clip_to_canvas = value;
+          changed();
+          applyLive();
+        },
+        'Cuts off backdrops and effects that full-scene models draw past their own edges.',
+      ),
     );
-    host.appendChild(
-      checkbox('Hide anything outside the model canvas', modelSettings.clip_to_canvas, (value) => {
-        modelSettings.clip_to_canvas = value;
-        controller.saveDebounced();
-        applyLive();
-      }),
-    );
-    host.appendChild(
-      slider('Eye follow offset', -100, 100, 1, modelSettings.eye, (value) => {
-        modelSettings.eye = value;
-        controller.saveDebounced();
-        applyLive();
-      }),
-    );
+    view.appendChild(note('Drag the model on the stage to move it.'));
+    host.appendChild(section('View', [view]));
 
-    // Mouth animation
+    // ── Animations: starter / default / click ──
+    const animationStatus = statusLine();
+    const animations = el('div');
+    animations.appendChild(animationStatus.root);
+    const starterRow = this.animationRow('On chat open', description, modelSettings.animation_starter, animationStatus, play);
+    starterRow.appendChild(
+      slider(
+        'Delay before it plays',
+        { min: 0, max: 10000, step: 100, unit: 'ms', reset: 0 },
+        modelSettings.animation_starter.delay ?? 0,
+        (value) => {
+          modelSettings.animation_starter.delay = value;
+          changed();
+        },
+      ),
+    );
+    animations.appendChild(starterRow);
+    const defaultRow = this.animationRow('Default', description, modelSettings.animation_default, animationStatus, play);
+    defaultRow.appendChild(
+      checkbox(
+        'Loop the default animation',
+        modelSettings.animation_default.loop,
+        (value) => {
+          modelSettings.animation_default.loop = value;
+          changed();
+        },
+        'The default motion replaces the model’s idle motion and the default expression stays on. ' +
+          'Chat-open, click and emotion animations play once, then the default comes back.',
+      ),
+    );
+    animations.appendChild(defaultRow);
+
+    const clickRow = this.animationRow('On click', description, modelSettings.animation_click, animationStatus, play);
+    const clickMessage = el('input', 'l2d-input') as HTMLInputElement;
+    clickMessage.type = 'text';
+    clickMessage.placeholder = 'Optional';
+    clickMessage.value = modelSettings.animation_click.message;
+    clickMessage.addEventListener('change', () => {
+      modelSettings.animation_click.message = clickMessage.value;
+      changed();
+    });
+    clickRow.appendChild(field('Message', clickMessage));
+    clickRow.appendChild(note('Plays when you click the model outside its hit areas. The message, if any, is posted to the chat.'));
+    animations.appendChild(clickRow);
+    host.appendChild(section('Animations', [animations]));
+
+    // ── Emotion (classify) mappings ──
+    const emotionStatus = statusLine();
+    const classify = el('div');
+    classify.appendChild(emotionStatus.root);
+    const grid = el('div', 'l2d-mapping-grid');
+    grid.setAttribute('role', 'table');
+    grid.setAttribute('aria-label', 'Emotion mappings');
+    const head = el('div', 'l2d-mapping-head');
+    head.setAttribute('role', 'row');
+    for (const title of ['Emotion', 'Expression', 'Motion', '']) {
+      const cell = el('span', undefined, title);
+      cell.setAttribute('role', 'columnheader');
+      head.appendChild(cell);
+    }
+    grid.appendChild(head);
+    for (const label of CLASSIFY_EXPRESSIONS) {
+      const mapping = modelSettings.classify_mapping[label]!;
+      const line = el('div', 'l2d-mapping-row');
+      line.setAttribute('role', 'row');
+      const mark = () => line.classList.toggle('l2d-unset', mapping.expression === 'none' && mapping.motion === 'none');
+      const expression = select(expressionOptions(description), mapping.expression, (value) => {
+        mapping.expression = value;
+        changed();
+        mark();
+      });
+      expression.setAttribute('aria-label', `Expression for ${label}`);
+      const motion = select(motionOptions(description), mapping.motion, (value) => {
+        mapping.motion = value;
+        changed();
+        mark();
+      });
+      motion.setAttribute('aria-label', `Motion for ${label}`);
+      line.append(
+        el('span', 'l2d-emotion', label),
+        expression,
+        motion,
+        iconButton('▶', `Play ${label} animation`, () => play(emotionStatus, mapping)),
+      );
+      mark();
+      grid.appendChild(line);
+    }
+    classify.appendChild(grid);
+    classify.appendChild(note('A new character message plays the expression and motion mapped to its emotion. Dimmed rows play nothing.'));
+    host.appendChild(section('Emotion mappings', [classify], { open: false }));
+
+    // ── Hit areas ──
+    const hitBody = el('div');
+    this.renderHitAreas(hitBody, characterId, modelId, description, modelSettings);
+    host.appendChild(section('Hit areas', [hitBody], { open: false, className: 'l2d-hit-areas' }));
+
+    // ── Talking mouth animation ──
     const mouth = el('div');
     mouth.appendChild(
-      row(
+      field(
         'Mouth open parameter',
         select(parameterOptions(description), modelSettings.param_mouth_open_y_id, (value) => {
           modelSettings.param_mouth_open_y_id = value;
-          controller.saveDebounced();
+          changed();
         }),
       ),
     );
     mouth.appendChild(
-      slider('Mouth open speed', 0.1, 3, 0.1, modelSettings.mouth_open_speed, (value) => {
+      slider('Mouth open speed', { min: 0.1, max: 3, step: 0.1, unit: '×', reset: defaults.mouth_open_speed }, modelSettings.mouth_open_speed, (value) => {
         modelSettings.mouth_open_speed = value;
-        controller.saveDebounced();
+        changed();
       }),
     );
     mouth.appendChild(
-      slider('Talk time per character (ms)', 0, 100, 1, modelSettings.mouth_time_per_character, (value) => {
-        modelSettings.mouth_time_per_character = value;
-        controller.saveDebounced();
+      slider(
+        'Talk time per character',
+        { min: 0, max: 100, step: 1, unit: 'ms', reset: defaults.mouth_time_per_character },
+        modelSettings.mouth_time_per_character,
+        (value) => {
+          modelSettings.mouth_time_per_character = value;
+          changed();
+        },
+      ),
+    );
+    host.appendChild(section('Talking mouth animation', [mouth], { open: false }));
+
+    // ── Cursor tracking ──
+    const cursor = el('div');
+    cursor.appendChild(
+      slider('Eye follow offset', { min: -100, max: 100, step: 1, reset: defaults.eye }, modelSettings.eye, (value) => {
+        modelSettings.eye = value;
+        changed();
+        applyLive();
       }),
     );
-    host.appendChild(section('Talking mouth animation', mouth));
-
-    // Cursor tracking parameters
-    const cursor = el('div');
     for (const paramId of CURSOR_PARAM_IDS) {
       cursor.appendChild(
-        row(
+        field(
           paramId.replace(/^idParam/, ''),
           select(parameterOptions(description), modelSettings.cursor_param[paramId] ?? 'none', (value) => {
             modelSettings.cursor_param[paramId] = value;
-            controller.saveDebounced();
+            changed();
             applyLive();
           }),
         ),
       );
     }
-    cursor.appendChild(note('Auto-detected on first load when the model uses standard parameter names.'));
-    host.appendChild(section('Cursor tracking parameters', cursor));
-
-    // Animations: starter / default / click
-    const animations = el('div');
-    animations.appendChild(this.animationRow('Starter', characterId, description, modelSettings.animation_starter, true));
-    const defaultRow = this.animationRow('Default', characterId, description, modelSettings.animation_default, false);
-    defaultRow.appendChild(
-      checkbox('Loop the default animation', modelSettings.animation_default.loop, (value) => {
-        modelSettings.animation_default.loop = value;
-        controller.saveDebounced();
-      }),
+    cursor.appendChild(
+      note('The parameters the model turns toward the cursor (Global → Follow cursor). Auto-detected on first load when the model uses standard names.'),
     );
-    defaultRow.appendChild(
-      note(
-        'When looping, the default motion replaces the model’s idle motion and the default expression stays on. ' +
-          'Starter, click and emotion animations play once, then the default comes back.',
-      ),
-    );
-    animations.appendChild(defaultRow);
-
-    const clickRow = this.animationRow('On click', characterId, description, modelSettings.animation_click, false);
-    const clickMessage = el('input', 'l2d-input') as HTMLInputElement;
-    clickMessage.type = 'text';
-    clickMessage.placeholder = 'Message sent when clicked (optional)';
-    clickMessage.value = modelSettings.animation_click.message;
-    clickMessage.addEventListener('change', () => {
-      modelSettings.animation_click.message = clickMessage.value;
-      controller.saveDebounced();
-    });
-    clickRow.appendChild(row('Click message', clickMessage));
-    animations.appendChild(clickRow);
-    host.appendChild(section('Animations', animations));
-
-    // Emotion (classify) mappings
-    const classify = el('div');
-    for (const label of CLASSIFY_EXPRESSIONS) {
-      const mapping = modelSettings.classify_mapping[label]!;
-      classify.appendChild(
-        row(
-          el('span', 'l2d-emotion', label),
-          select(expressionOptions(description), mapping.expression, (value) => {
-            mapping.expression = value;
-            controller.saveDebounced();
-          }),
-          select(motionOptions(description), mapping.motion, (value) => {
-            mapping.motion = value;
-            controller.saveDebounced();
-          }),
-          button('▶', () => play(mapping)),
-        ),
-      );
-    }
-    const classifySection = section('Emotion mappings', classify);
-    (classifySection as HTMLDetailsElement).open = false;
-    host.appendChild(classifySection);
-
-    // Hit areas
-    const hitSection = section('Hit areas');
-    hitSection.classList.add('l2d-hit-areas');
-    const hitDetails = hitSection as HTMLDetailsElement;
-    hitDetails.open = this.hitAreasOpen;
-    hitDetails.addEventListener('toggle', () => {
-      this.hitAreasOpen = hitDetails.open;
-    });
-    const hitBody = el('div');
-    hitSection.appendChild(hitBody);
-    this.renderHitAreas(hitBody, characterId, modelId, description, modelSettings);
-    host.appendChild(hitSection);
+    host.appendChild(section('Cursor tracking', [cursor], { open: false }));
   }
 
   /**
@@ -1003,14 +1248,19 @@ export class SettingsUI {
       host.replaceChildren();
       this.renderHitAreas(host, characterId, modelId, description, modelSettings);
     };
+    const hint = el('span', 'l2d-dim', '');
+    hint.setAttribute('role', 'status');
     const play = (mapping: { expression: string; motion: string }) => {
+      if (!stage.isOnStage(characterId, modelId)) {
+        hint.textContent = 'Show the model first, then try again.';
+        return;
+      }
       void stage.playExpression(characterId, mapping.expression);
       void stage.playMotion(characterId, mapping.motion, true);
     };
     const modelAreas = description.hitAreas;
     const custom = modelSettings.custom_hit_areas;
     const taken = (name: string) => modelAreas.includes(name) || custom.some((area) => area.name === name);
-    const hint = el('span', 'l2d-dim', '');
 
     host.appendChild(
       checkbox('Show hit areas on the model', modelSettings.show_hit_areas, (value) => {
@@ -1025,12 +1275,14 @@ export class SettingsUI {
       ),
     );
 
-    const mappingControls = (area: string) => {
+    /** One area: its name and buttons on top, then what it plays and the message it posts. */
+    const card = (name: HTMLElement, area: string, actions: HTMLElement[]) => {
       const mapping = (modelSettings.hit_areas[area] ??= { expression: 'none', motion: 'none', message: '' });
       const message = el('input', 'l2d-input') as HTMLInputElement;
       message.type = 'text';
-      message.placeholder = 'Message';
-      message.title = 'Message sent to the chat when this area is tapped (optional)';
+      message.placeholder = 'Message (optional)';
+      message.title = 'Message posted to the chat when this area is tapped';
+      message.setAttribute('aria-label', `Message for ${area}`);
       message.value = mapping.message;
       message.addEventListener('change', () => {
         mapping.message = message.value;
@@ -1041,14 +1293,20 @@ export class SettingsUI {
         controller.saveDebounced();
       });
       expression.title = 'Expression';
+      expression.setAttribute('aria-label', `Expression for ${area}`);
       const motion = select(motionOptions(description), mapping.motion, (value) => {
         mapping.motion = value;
         controller.saveDebounced();
       });
       motion.title = 'Motion';
-      const test = button('▶', () => play(mapping));
-      test.title = 'Play';
-      return [expression, motion, message, test];
+      motion.setAttribute('aria-label', `Motion for ${area}`);
+      const wrap = el('div', 'l2d-mapping');
+      const top = el('div', 'l2d-mapping-top');
+      top.append(name, iconButton('▶', `Play ${area}`, () => play(mapping)), ...actions);
+      const choices = el('div', 'l2d-mapping-choices');
+      choices.append(expression, motion);
+      wrap.append(top, choices, message);
+      return wrap;
     };
 
     /** Let the user drag out an area on the model; `done` gets the rectangle (fractions of the model canvas). */
@@ -1093,7 +1351,7 @@ export class SettingsUI {
         );
       }
       for (const area of modelAreas) {
-        host.appendChild(row(el('span', 'l2d-emotion', area), ...mappingControls(area)));
+        host.appendChild(card(el('span', 'l2d-mapping-name', area), area, []));
       }
     } else {
       host.appendChild(note('This model’s file defines no hit areas. Draw your own below.'));
@@ -1105,6 +1363,7 @@ export class SettingsUI {
       name.type = 'text';
       name.value = area.name;
       name.title = 'Area name';
+      name.setAttribute('aria-label', 'Area name');
       name.addEventListener('change', () => {
         const next = name.value.trim().slice(0, 64);
         if (next === area.name) return;
@@ -1128,21 +1387,21 @@ export class SettingsUI {
         }),
       );
       redraw.title = 'Drag a new rectangle for this area on the model';
-      const remove = button('✕', () => {
+      const remove = iconButton('✕', `Delete ${area.name}`, () => {
         const index = custom.indexOf(area);
         if (index !== -1) custom.splice(index, 1);
         if (!modelAreas.includes(area.name)) delete modelSettings.hit_areas[area.name];
         controller.saveDebounced();
         rerender();
       });
-      remove.title = `Delete ${area.name}`;
-      remove.setAttribute('aria-label', `Delete ${area.name}`);
-      host.appendChild(row(name, ...mappingControls(area.name), redraw, remove));
+      remove.classList.add('l2d-btn-danger');
+      host.appendChild(card(name, area.name, [redraw, remove]));
     }
 
     const newName = el('input', 'l2d-input l2d-area-name') as HTMLInputElement;
     newName.type = 'text';
     newName.placeholder = 'New area, e.g. Head';
+    newName.setAttribute('aria-label', 'New area name');
     const add = button('Add area', () => {
       const name = newName.value.trim().slice(0, 64);
       if (!name) {
@@ -1185,95 +1444,140 @@ export class SettingsUI {
       rerender();
     });
     suggest.title = 'Set areas (and “On click”) that play nothing yet to the model’s motion groups named for tapping them, like “Tap”, “TapHead” or “touch_body”';
-    host.appendChild(row(newName, add, suggest));
+    host.appendChild(row(newName, add));
+    host.appendChild(row(suggest));
     host.appendChild(row(hint));
   }
 
+  /** An animation's title with a play button, then its expression and motion. */
   private animationRow(
     label: string,
-    characterId: string,
     description: ModelDescription,
-    mapping: { expression: string; motion: string; delay?: number },
-    withDelay: boolean,
+    mapping: { expression: string; motion: string },
+    status: { say(text: string): void },
+    play: (status: { say(text: string): void }, mapping: { expression: string; motion: string }) => void,
   ): HTMLDivElement {
     const controller = this.controller;
     const wrap = el('div', 'l2d-anim');
-    wrap.appendChild(el('div', 'l2d-anim-title', label));
+    const title = el('div', 'l2d-anim-head');
+    title.append(el('span', 'l2d-anim-title', label), iconButton('▶', `Play ${label} animation`, () => play(status, mapping)));
+    wrap.appendChild(title);
     wrap.appendChild(
-      row(
+      field(
         'Expression',
         select(expressionOptions(description), mapping.expression, (value) => {
           mapping.expression = value;
           controller.saveDebounced();
         }),
+      ),
+    );
+    wrap.appendChild(
+      field(
         'Motion',
         select(motionOptions(description), mapping.motion, (value) => {
           mapping.motion = value;
           controller.saveDebounced();
         }),
-        button('▶', () => {
-          void controller.stage.playExpression(characterId, mapping.expression);
-          void controller.stage.playMotion(characterId, mapping.motion, true);
-        }),
       ),
     );
-    if (withDelay) {
-      wrap.appendChild(
-        slider('Delay before starter (ms)', 0, 10000, 100, mapping.delay ?? 0, (value) => {
-          mapping.delay = value;
-          controller.saveDebounced();
-        }),
-      );
-    }
     return wrap;
   }
 }
 
 export const UI_CSS = `
-.l2d-root { padding: 10px 12px; color: var(--lumiverse-text); font-size: 13px; }
-.l2d-section { margin-bottom: 10px; border: 1px solid var(--lumiverse-border); border-radius: var(--lumiverse-radius); padding: 8px 10px; background: var(--lumiverse-fill-subtle); }
-.l2d-section-title { cursor: pointer; font-weight: 600; margin: 0 0 4px; color: var(--lumiverse-text); }
-.l2d-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 6px 0; }
-.l2d-label { color: var(--lumiverse-text-muted); min-width: 90px; }
-.l2d-note { color: var(--lumiverse-text-dim); font-size: 12px; margin: 6px 0; }
+.l2d-root { padding: 10px 12px; color: var(--lumiverse-text); font-size: 13px; container-type: inline-size; }
+.l2d-section { margin-bottom: 10px; border: 1px solid var(--lumiverse-border); border-radius: var(--lumiverse-radius); padding: 0 10px; background: var(--lumiverse-fill-subtle); }
+.l2d-section[open] { padding-bottom: 8px; }
+.l2d-section .l2d-section { margin: 8px 0 0; background: transparent; }
+.l2d-section-title { display: flex; align-items: center; gap: 6px; cursor: pointer; font-weight: 600; padding: 8px 0; color: var(--lumiverse-text); list-style: none; user-select: none; }
+.l2d-section-title::-webkit-details-marker { display: none; }
+.l2d-section-title::before { content: ''; flex: none; width: 6px; height: 6px; margin: 0 3px 0 1px; border-right: 1.5px solid var(--lumiverse-text-dim); border-bottom: 1.5px solid var(--lumiverse-text-dim); transform: rotate(-45deg); transition: transform var(--lumiverse-transition-fast, 0.15s); }
+.l2d-section[open] > .l2d-section-title::before { transform: rotate(45deg); }
+.l2d-section-title:hover::before { border-color: var(--lumiverse-text); }
+.l2d-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; margin: 6px 0; }
+.l2d-field { display: grid; grid-template-columns: minmax(72px, 34%) minmax(0, 1fr); align-items: center; gap: 8px; margin: 6px 0; }
+.l2d-field-control { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.l2d-field-control > .l2d-select, .l2d-field-control > .l2d-input, .l2d-field-control > .l2d-picker { flex: 1; min-width: 0; max-width: none; width: 100%; }
+.l2d-label { color: var(--lumiverse-text-muted); }
+.l2d-note { color: var(--lumiverse-text-dim); font-size: 12px; line-height: 1.45; margin: 6px 0; }
 .l2d-dim { color: var(--lumiverse-text-dim); font-size: 12px; }
-.l2d-btn { padding: 4px 10px; border-radius: var(--lumiverse-radius); border: 1px solid var(--lumiverse-border); background: var(--lumiverse-fill); color: var(--lumiverse-text); cursor: pointer; }
-.l2d-btn:hover { border-color: var(--lumiverse-border-hover); }
-.l2d-check { display: flex; align-items: center; gap: 8px; margin: 6px 0; cursor: pointer; }
-.l2d-select { max-width: 100%; min-width: 140px; padding: 3px 6px; border-radius: var(--lumiverse-radius); border: 1px solid var(--lumiverse-border); background: var(--lumiverse-fill); color: var(--lumiverse-text); }
-.l2d-input { flex: 1; min-width: 120px; padding: 4px 8px; border-radius: var(--lumiverse-radius); border: 1px solid var(--lumiverse-border); background: var(--lumiverse-fill); color: var(--lumiverse-text); }
-.l2d-slider { margin: 8px 0; }
-.l2d-slider input[type=range] { width: 100%; }
-.l2d-slider-head { display: flex; justify-content: space-between; color: var(--lumiverse-text-muted); }
-.l2d-slider-value { color: var(--lumiverse-text); }
-.l2d-emotion { min-width: 110px; color: var(--lumiverse-text-muted); }
-.l2d-input.l2d-area-name { flex: 0 1 110px; min-width: 80px; }
+.l2d-dim:empty { display: none; }
+.l2d-btn { padding: 4px 10px; border-radius: var(--lumiverse-radius); border: 1px solid var(--lumiverse-border); background: var(--lumiverse-fill); color: var(--lumiverse-text); cursor: pointer; font: inherit; line-height: 1.4; }
+.l2d-btn:hover:not(:disabled) { border-color: var(--lumiverse-border-hover); background: var(--lumiverse-fill-hover, var(--lumiverse-fill)); }
+.l2d-btn:focus-visible, .l2d-select:focus-visible, .l2d-input:focus-visible, .l2d-number:focus-visible, .l2d-section-title:focus-visible { outline: 2px solid var(--lumiverse-primary, var(--lumiverse-accent)); outline-offset: 1px; }
+.l2d-btn-primary { border-color: var(--lumiverse-primary, var(--lumiverse-accent)); }
+.l2d-btn-danger:hover:not(:disabled) { border-color: var(--lumiverse-danger, #e5484d); color: var(--lumiverse-danger, #e5484d); }
+.l2d-icon-btn { flex: none; width: 28px; height: 28px; padding: 0; display: inline-flex; align-items: center; justify-content: center; font-size: 11px; }
+.l2d-icon-btn[hidden] { display: none; }
+.l2d-check { display: flex; align-items: flex-start; gap: 8px; margin: 8px 0; cursor: pointer; }
+.l2d-check input { margin: 2px 0 0; flex: none; accent-color: var(--lumiverse-primary, var(--lumiverse-accent)); }
+.l2d-check-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.l2d-hint { color: var(--lumiverse-text-dim); font-size: 12px; line-height: 1.4; }
+.l2d-select { max-width: 100%; min-width: 0; padding: 4px 6px; border-radius: var(--lumiverse-radius); border: 1px solid var(--lumiverse-border); background: var(--lumiverse-fill); color: var(--lumiverse-text); font: inherit; text-overflow: ellipsis; }
+.l2d-input { flex: 1; min-width: 120px; padding: 4px 8px; border-radius: var(--lumiverse-radius); border: 1px solid var(--lumiverse-border); background: var(--lumiverse-fill); color: var(--lumiverse-text); font: inherit; }
+.l2d-slider { margin: 6px 0 2px; }
+.l2d-slider-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--lumiverse-text-muted); min-height: 28px; }
+.l2d-slider-value { display: inline-flex; align-items: center; gap: 4px; color: var(--lumiverse-text); }
+.l2d-number { width: 64px; padding: 2px 6px; border-radius: var(--lumiverse-radius); border: 1px solid transparent; background: transparent; color: var(--lumiverse-text); font: inherit; font-variant-numeric: tabular-nums; text-align: right; -moz-appearance: textfield; }
+.l2d-number::-webkit-inner-spin-button, .l2d-number::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+.l2d-number:hover, .l2d-number:focus { border-color: var(--lumiverse-border); background: var(--lumiverse-fill); }
+.l2d-unit { color: var(--lumiverse-text-dim); min-width: 1ch; }
+.l2d-slider-value .l2d-icon-btn { width: 24px; height: 24px; font-size: 13px; }
+.l2d-range { display: block; width: 100%; margin: 0; }
+@media (pointer: fine) { .l2d-root input.l2d-range { min-height: 24px; } }
+.l2d-root input.l2d-range::-webkit-slider-runnable-track { background: linear-gradient(to right, var(--lumiverse-primary, var(--lumiverse-accent)) var(--l2d-fill, 0%), var(--lumiverse-border) var(--l2d-fill, 0%)); }
+.l2d-root input.l2d-range::-moz-range-track { background: var(--lumiverse-border); }
+.l2d-root input.l2d-range::-moz-range-progress { height: 4px; border-radius: 2px; background: var(--lumiverse-primary, var(--lumiverse-accent)); }
+@media (pointer: fine) { .l2d-root input.l2d-range::-webkit-slider-thumb { width: 16px; height: 16px; margin-top: -6px; } .l2d-root input.l2d-range::-moz-range-thumb { width: 16px; height: 16px; } }
+.l2d-emotion { color: var(--lumiverse-text-muted); }
+.l2d-input.l2d-area-name { flex: 1 1 100px; min-width: 80px; }
 .l2d-model-name { font-weight: 600; }
-.l2d-anim { border-top: 1px solid var(--lumiverse-border); padding-top: 6px; margin-top: 6px; }
-.l2d-anim-title { font-weight: 600; color: var(--lumiverse-text-muted); }
-.l2d-banner { border: 1px solid var(--lumiverse-accent); border-radius: var(--lumiverse-radius); padding: 8px 10px; margin-bottom: 10px; }
+.l2d-anim { border-top: 1px solid var(--lumiverse-border); padding-top: 4px; margin-top: 8px; }
+.l2d-anim:first-of-type { border-top: none; margin-top: 0; }
+.l2d-anim-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 30px; }
+.l2d-anim-title { font-weight: 600; color: var(--lumiverse-text-muted); margin-top: 6px; }
+.l2d-anim-head .l2d-anim-title { margin: 0; }
+.l2d-mapping-grid { display: grid; grid-template-columns: auto minmax(0, 1fr) minmax(0, 1fr) auto; gap: 4px 6px; align-items: center; margin: 6px 0; }
+.l2d-mapping-head, .l2d-mapping-row { display: contents; }
+.l2d-mapping-head > span { color: var(--lumiverse-text-dim); font-size: 11px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.l2d-mapping-row > .l2d-select { width: 100%; font-size: 12px; }
+.l2d-mapping-row.l2d-unset > .l2d-emotion, .l2d-mapping-row.l2d-unset > .l2d-select { opacity: 0.55; }
+.l2d-mapping { border: 1px solid var(--lumiverse-border); border-radius: var(--lumiverse-radius); padding: 6px 8px; margin: 6px 0; display: flex; flex-direction: column; gap: 6px; }
+.l2d-mapping-top { display: flex; align-items: center; gap: 6px; }
+.l2d-mapping-name { flex: 1; min-width: 0; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.l2d-mapping-choices { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 6px; }
+.l2d-mapping-choices > .l2d-select { width: 100%; }
+.l2d-mapping > .l2d-input { min-width: 0; }
+.l2d-banner { border: 1px solid var(--lumiverse-primary, var(--lumiverse-accent)); border-radius: var(--lumiverse-radius); padding: 8px 10px; margin-bottom: 10px; }
 .l2d-banner-title { font-weight: 600; margin-bottom: 4px; }
 .l2d-banner-line { color: var(--lumiverse-text-muted); font-size: 12px; margin: 2px 0 6px; }
 .l2d-segmented { display: inline-flex; }
 .l2d-segmented .l2d-btn { border-radius: 0; }
 .l2d-segmented .l2d-btn:first-child { border-radius: var(--lumiverse-radius) 0 0 var(--lumiverse-radius); }
 .l2d-segmented .l2d-btn:last-child { border-radius: 0 var(--lumiverse-radius) var(--lumiverse-radius) 0; margin-left: -1px; }
-.l2d-btn.l2d-active { background: var(--lumiverse-fill-hover, var(--lumiverse-fill)); border-color: var(--lumiverse-accent); }
+.l2d-btn.l2d-active { background: var(--lumiverse-fill-hover, var(--lumiverse-fill)); border-color: var(--lumiverse-primary, var(--lumiverse-accent)); position: relative; }
 .l2d-btn:disabled { opacity: 0.5; cursor: default; }
-.l2d-library-filter { min-width: 140px; }
-.l2d-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(88px, 1fr)); gap: 6px; margin: 8px 0; }
+.l2d-library-filter { min-width: 120px; }
+.l2d-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 6px; margin: 8px 0; }
 .l2d-tile { position: relative; display: flex; flex-direction: column; gap: 2px; min-width: 0; padding: 4px; border: 1px solid var(--lumiverse-border); border-radius: var(--lumiverse-radius); background: var(--lumiverse-fill); }
+.l2d-tile.l2d-current, .l2d-list-row.l2d-current { border-color: var(--lumiverse-primary, var(--lumiverse-accent)); box-shadow: 0 0 0 1px var(--lumiverse-primary, var(--lumiverse-accent)); }
 .l2d-tile-delete { position: absolute; top: 6px; right: 6px; padding: 0 6px !important; font-size: 11px; line-height: 18px; opacity: 0.55; }
 .l2d-tile:hover .l2d-tile-delete, .l2d-tile-delete:focus-visible { opacity: 1; }
 .l2d-tile-meta { color: var(--lumiverse-text-dim); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .l2d-tile-thumb { width: 100%; aspect-ratio: 1; object-fit: contain; border-radius: var(--lumiverse-radius); background: var(--lumiverse-fill-subtle); }
 .l2d-tile-name { font-weight: 600; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.l2d-list-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+.l2d-list-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; padding: 4px; border: 1px solid transparent; border-radius: var(--lumiverse-radius); }
 .l2d-list-text { flex: 1; min-width: 0; }
 .l2d-list-text > * { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .l2d-list-thumb { width: 32px; height: 32px; object-fit: contain; border-radius: var(--lumiverse-radius); background: var(--lumiverse-fill-subtle); flex: none; }
 .l2d-thumb-empty { display: flex; align-items: center; justify-content: center; color: var(--lumiverse-text-dim); font-weight: 600; font-size: 20px; }
 .l2d-list-thumb.l2d-thumb-empty { font-size: 14px; }
-.l2d-picker { flex: 1; min-width: 180px; max-width: 360px; }
+.l2d-picker { flex: 1; min-width: 160px; max-width: 360px; }
 .l2d-embedded-host { position: relative; width: 100%; height: 420px; overflow: hidden; border-radius: var(--lumiverse-radius); border: 1px solid var(--lumiverse-border); }
+@container (max-width: 300px) {
+  .l2d-field { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+  .l2d-mapping-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; }
+  .l2d-mapping-head > span:first-child { display: none; }
+  .l2d-mapping-row > .l2d-emotion { grid-column: 1 / -1; margin-top: 4px; }
+}
 `;

@@ -115,20 +115,16 @@ async function setLibrarySort(label) {
 /** The value of a slider in Model settings, by its label. */
 function sliderValue(label) {
   return page.evaluate((label) => {
-    const slider = [...document.querySelectorAll('.l2d-slider')].find(
-      (node) => node.querySelector('.l2d-slider-head span')?.textContent === label,
-    );
-    return slider ? Number(slider.querySelector('input').value) : null;
+    const input = document.querySelector(`.l2d-root input[type=range][aria-label="${label}"]`);
+    return input ? Number(input.value) : null;
   }, label);
 }
 
 function setSlider(label, value) {
   return page.evaluate(
     ([label, value]) => {
-      const slider = [...document.querySelectorAll('.l2d-slider')].find(
-        (node) => node.querySelector('.l2d-slider-head span')?.textContent === label,
-      );
-      const input = slider.querySelector('input');
+      const input = document.querySelector(`.l2d-root input[type=range][aria-label="${label}"]`);
+      if (!input) throw new Error(`No slider labelled "${label}"`);
       input.value = String(value);
       input.dispatchEvent(new Event('input', { bubbles: true }));
     },
@@ -248,8 +244,8 @@ async function libraryTest() {
 
   // Export this character's settings, change them, and import the file back.
   await page.waitForSelector('.l2d-slider', { timeout: 60000 });
-  await setSlider('Scale', 0.8);
-  await setSlider('Rotation (°)', 15);
+  await setSlider('Zoom', 0.8);
+  await setSlider('Rotation', 15);
   await page.waitForTimeout(800);
   const [download] = await Promise.all([
     page.waitForEvent('download', { timeout: 10000 }),
@@ -267,11 +263,11 @@ async function libraryTest() {
     `exported ${download.suggestedFilename()} (scale ${file.settings?.scale}, rotation ${file.settings?.rotation})`,
   );
 
-  await setSlider('Scale', 1.3);
-  await setSlider('Rotation (°)', 0);
+  await setSlider('Zoom', 1.3);
+  await setSlider('Rotation', 0);
   const dialog = await importSettingsFile(exported);
   check(dialog?.includes(MODEL_NAME), 'import asks before replacing the settings');
-  check((await sliderValue('Scale')) === 0.8 && (await sliderValue('Rotation (°)')) === 15, 'import restored scale 0.8 and rotation 15');
+  check((await sliderValue('Zoom')) === 0.8 && (await sliderValue('Rotation')) === 15, 'import restored scale 0.8 and rotation 15');
   check((await fileStatus()).startsWith('Imported'), `status: ${await fileStatus()}`);
 
   // A file for a model that isn't in the library applies to the bound model after a warning.
@@ -283,7 +279,7 @@ async function libraryTest() {
   const warning = await importSettingsFile(missing);
   check(warning?.includes("isn't in your library"), 'a file for a missing model warns before applying');
   await page.screenshot({ path: `${OUT}/import-applied.png` });
-  check((await sliderValue('Scale')) === 0.5 && (await sliderValue('Eye follow offset')) === 45, 'it applied scale 0.5 and ignored the bad eye value');
+  check((await sliderValue('Zoom')) === 0.5 && (await sliderValue('Eye follow offset')) === 45, 'it applied scale 0.5 and ignored the bad eye value');
 
   // A Spine settings file is refused with a message.
   const spine = path.join(OUT, 'spine.json');
@@ -306,8 +302,8 @@ async function libraryTest() {
   check(kept.sort === 'largest' && kept.list > 0, `sort and view kept after a reload (${JSON.stringify(kept)})`);
   await page.click('.l2d-segmented button:text-is("Tiles")');
   await setLibrarySort('Name (A–Z)');
-  await setSlider('Scale', 1);
-  await setSlider('Rotation (°)', 0);
+  await setSlider('Zoom', 1);
+  await setSlider('Rotation', 0);
   await page.waitForTimeout(1000);
 }
 
@@ -824,7 +820,7 @@ async function runGroup() {
   await page.screenshot({ path: `${OUT}/group-dragged.png` });
   await openTab(live2d);
   await selectCharacterIn(live2d, members[0]);
-  const draggedX = await sliderValue('X offset (%)');
+  const draggedX = await sliderValue('X offset');
   const columnWidth = afterLive2D.width / members.length;
   // The model follows the pointer exactly (40px from x = 0 after Fit); its drawn box can move less.
   const expectedX = (40 / (columnWidth / 2)) * 100;
@@ -961,15 +957,15 @@ async function hitAreaTest(freshBinding) {
   const text = await section.innerText();
   // The model file's areas are the rows before "Drawn on the model" that have no name field.
   const fileAreas = await section
-    .locator('.l2d-row:has(> span.l2d-emotion)')
-    .evaluateAll((rows) => rows.map((row) => row.querySelector('span.l2d-emotion').textContent));
+    .locator('.l2d-mapping:has(span.l2d-mapping-name)')
+    .evaluateAll((rows) => rows.map((row) => row.querySelector('span.l2d-mapping-name').textContent));
   if (fileAreas.length === 0) {
     check(text.includes('defines no hit areas'), 'a model without hit areas says so and offers drawing them');
   } else {
     console.log(`Hit areas from the model: ${fileAreas.join(', ')}`);
     // Give every file area a motion, so a tap on the model's body lands on one.
     for (const area of fileAreas) {
-      const motion = section.locator(`.l2d-row:has(> span.l2d-emotion:text-is("${area}")) select`).nth(1);
+      const motion = section.locator(`.l2d-mapping:has(span.l2d-mapping-name:text-is("${area}")) select`).nth(1);
       if ((await motion.inputValue()) === 'none') {
         await motion.selectOption({ index: 1 });
         console.log(`  ${area}: set to ${await motion.inputValue()}`);
@@ -982,7 +978,7 @@ async function hitAreaTest(freshBinding) {
     // haru_ja has a "Tap" motion group: a new binding plays it on click.
     const onClick = await page.evaluate(() => {
       const title = [...document.querySelectorAll('.l2d-anim-title')].find((node) => node.textContent === 'On click');
-      return title?.parentElement?.querySelectorAll('select')[1]?.value ?? null;
+      return title?.closest('.l2d-anim')?.querySelectorAll('select')[1]?.value ?? null;
     });
     check(onClick === 'Tap_id=random', `a new binding's On click uses the model's tap motion (${onClick})`);
   }
@@ -1017,7 +1013,7 @@ async function hitAreaTest(freshBinding) {
     'drawing an area turns on Show hit areas',
   );
   // Give it a motion: the last one in the list, unlike On click's.
-  const headMotion = section.locator('.l2d-row:has(input.l2d-area-name)').first().locator('select').nth(1);
+  const headMotion = section.locator('.l2d-mapping:has(input.l2d-area-name)').first().locator('select').nth(1);
   const motionCount = await headMotion.locator('option').count();
   await headMotion.selectOption({ index: motionCount - 1 });
   const chosenMotion = await headMotion.inputValue();
@@ -1043,7 +1039,7 @@ async function hitAreaTest(freshBinding) {
 
   // Rotated 90° counterclockwise about the model's center, the head is to the left of it.
   await openLive2DTab();
-  await setSlider('Rotation (°)', -90);
+  await setSlider('Rotation', -90);
   await page.waitForTimeout(1000);
   await reopenChat();
   const turned = { x: center.x - (center.y - headCenter.y), y: center.y };
@@ -1053,14 +1049,14 @@ async function hitAreaTest(freshBinding) {
   );
   check((await tapAt(headCenter.x, headCenter.y)) !== 'Face', 'rotated -90°, the old head position is not the area');
   await openLive2DTab();
-  await setSlider('Rotation (°)', 0);
+  await setSlider('Rotation', 0);
   await page.waitForTimeout(1000);
 
   // Saved: still there after a reload.
   await reopenChat();
   check((await tapAt(headCenter.x, headCenter.y)) === 'Face', 'after a reload the area is still there');
   section = await openHitAreas();
-  const motion = await section.locator('.l2d-row:has(input.l2d-area-name)').first().locator('select').nth(1).inputValue();
+  const motion = await section.locator('.l2d-mapping:has(input.l2d-area-name)').first().locator('select').nth(1).inputValue();
   check(motion === chosenMotion, `after a reload the area keeps its motion (${motion})`);
   await page.keyboard.press('Escape');
 }
