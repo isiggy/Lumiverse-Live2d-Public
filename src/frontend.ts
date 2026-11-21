@@ -116,6 +116,8 @@ export function setup(ctx: SpindleFrontendContext) {
     getModelSettings: getOrCreateModelSettings,
     saveSettingsDebounced: saveDebounced,
     layoutChanged: () => ui.layoutChanged(),
+    showContextMenu: async (x, y, items) =>
+      (await ctx.ui.showContextMenu({ position: { x, y }, items })).selectedKey ?? null,
     assets,
     layer: () => (overlayActive ? (backgroundModeOn() ? 'background' : 'front') : null),
     sendInteraction: (message, characterId) => {

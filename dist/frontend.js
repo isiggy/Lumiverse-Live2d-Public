@@ -294,6 +294,20 @@ var CHANGED_EVENT = "lumiverse-avatar-columns-changed";
 var OWNER_ATTRIBUTE = "data-lumiverse-avatar";
 var RANK_ATTRIBUTE = "data-lumiverse-avatar-rank";
 var LAYER_ATTRIBUTE = "data-lumiverse-avatar-layer";
+var MAX_ORDER = 1000;
+function arrangeColumns(order, arrangement) {
+  const moved = new Set(arrangement);
+  const first = order.characterIds.findIndex((id) => moved.has(id));
+  const rest = order.characterIds.filter((id) => !moved.has(id));
+  rest.splice(first === -1 ? rest.length : first, 0, ...moved);
+  while (rest.length > MAX_ORDER) {
+    const index = rest.findLastIndex((id) => !moved.has(id));
+    if (index === -1)
+      break;
+    rest.splice(index, 1);
+  }
+  return { characterIds: rest, at: Math.max(Date.now(), order.at + 1) };
+}
 function registry() {
   const scope = window;
   const existing = scope[REGISTRY_KEY];
@@ -350,7 +364,15 @@ class SharedColumns {
     shared.layers = { ...shared.layers, [this.extensionId]: ownLayers };
     window.dispatchEvent(new CustomEvent(CHANGED_EVENT, { detail: { extension: this.extensionId } }));
   }
-  layout(members, own, shared) {
+  shareOrder(order) {
+    const shared = registry();
+    if (shared.order && shared.order.at >= order.at)
+      return shared.order;
+    shared.order = { characterIds: [...order.characterIds], at: order.at };
+    window.dispatchEvent(new CustomEvent(CHANGED_EVENT, { detail: { extension: this.extensionId } }));
+    return shared.order;
+  }
+  layout(members, own, shared, order = []) {
     const withModel = new Set(own);
     if (shared) {
       for (const [extension, characterIds] of Object.entries(registry().extensions)) {
@@ -360,8 +382,11 @@ class SharedColumns {
           withModel.add(characterId);
       }
     }
+    const position = new Map(order.map((characterId, index) => [characterId, index]));
+    const placed = members.filter((characterId) => position.has(characterId));
+    placed.sort((a, b) => position.get(a) - position.get(b));
     const index = new Map;
-    for (const characterId of members) {
+    for (const characterId of [...placed, ...members.filter((characterId) => !position.has(characterId))]) {
       if (withModel.has(characterId) && !index.has(characterId))
         index.set(characterId, index.size);
     }
@@ -460,6 +485,21 @@ class SharedColumns {
     window.dispatchEvent(new CustomEvent(CHANGED_EVENT, { detail: { extension: this.extensionId } }));
   }
 }
+function modelMenu(stack, columns, extension, characterId) {
+  const rank = stack.findIndex((item) => item.extension === extension && item.characterId === characterId);
+  const column = columns.index.get(characterId);
+  if (rank === -1 || column === undefined || stack.length < 2)
+    return null;
+  const items = [
+    { key: "front", label: "Send to front", disabled: rank === stack.length - 1 },
+    { key: "back", label: "Send to back", disabled: rank === 0 },
+    { key: "divider", label: "", type: "divider" },
+    { key: "left", label: "Move left", disabled: column === 0 },
+    { key: "right", label: "Move right", disabled: column >= columns.count - 1 }
+  ];
+  return items;
+}
+var LONG_PRESS_MS = 550;
 var INTERACTIVE_SELECTOR = [
   "input",
   "textarea",
@@ -868,7 +908,8 @@ function defaultSettings() {
     global: defaultGlobalSettings(),
     characterModelMapping: {},
     characterModelsSettings: {},
-    characterLayers: {}
+    characterLayers: {},
+    columnOrder: { characterIds: [], at: 0 }
   };
 }
 function defaultModelSettings(hitAreaNames = []) {
@@ -926,6 +967,14 @@ function normalizeSettings(raw) {
       if (typeof layer === "number" && Number.isFinite(layer) && layer !== 0)
         base.characterLayers[characterId] = layer;
     }
+  }
+  const order = value.columnOrder;
+  if (order && typeof order === "object" && Array.isArray(order.characterIds)) {
+    const ids = order.characterIds.filter((id) => typeof id === "string" && id !== "");
+    base.columnOrder = {
+      characterIds: [...new Set(ids)],
+      at: typeof order.at === "number" && Number.isFinite(order.at) ? order.at : 0
+    };
   }
   return base;
 }
@@ -1208,6 +1257,7 @@ class Stage {
   previousInteraction = { characterId: "", message: "" };
   descriptionCache = new Map;
   drag = null;
+  longPress = null;
   suppressClick = false;
   pendingTap = null;
   drawing = null;
@@ -1220,6 +1270,7 @@ class Stage {
     [document, "pointercancel", () => this.endDrag(), { capture: true }],
     [document, "scroll", () => this.pendingTap = null, { capture: true, passive: true }],
     [document, "click", (event) => this.onClickCapture(event), { capture: true }],
+    [document, "contextmenu", (event) => this.onContextMenu(event), { capture: true }],
     [document, "touchstart", (event) => this.capturing() && event.preventDefault(), { capture: true, passive: false }],
     [document, "touchmove", (event) => this.capturing() && event.preventDefault(), { capture: true, passive: false }],
     [document, "keydown", (event) => this.onKeyDown(event), { capture: true }]
@@ -1296,7 +1347,12 @@ class Stage {
     const own = [...this.boundCharacters(settings).keys()];
     const overApp = this.host !== null && this.deps.layer() !== null;
     this.sharedColumns.publish(overApp ? own : [], settings.characterLayers);
-    const columns = this.sharedColumns.layout(this.characterIds, own, overApp);
+    const order = this.sharedColumns.shareOrder(settings.columnOrder);
+    if (order.at > settings.columnOrder.at) {
+      settings.columnOrder = { characterIds: [...order.characterIds], at: order.at };
+      this.deps.saveSettingsDebounced();
+    }
+    const columns = this.sharedColumns.layout(this.characterIds, own, overApp, settings.columnOrder.characterIds);
     const stack = this.sharedColumns.stack(columns, own, settings.characterLayers, overApp);
     const columnsChanged = !sameColumns(columns, this.columns);
     if (!columnsChanged && sameStack(stack, this.stack))
@@ -1322,6 +1378,22 @@ class Stage {
       delete settings.characterLayers[characterId];
     else
       settings.characterLayers[characterId] = layer;
+    this.deps.saveSettingsDebounced();
+    this.updateColumns();
+    return true;
+  }
+  moveToColumn(characterId, column) {
+    this.updateColumns();
+    const index = this.columns.index;
+    const current = index.get(characterId);
+    const target = Math.min(index.size - 1, Math.max(0, column));
+    if (current === undefined || current === target)
+      return false;
+    const arrangement = [...index.keys()].sort((a, b) => index.get(a) - index.get(b));
+    arrangement.splice(current, 1);
+    arrangement.splice(target, 0, characterId);
+    const settings = this.deps.getSettings();
+    settings.columnOrder = arrangeColumns(settings.columnOrder, arrangement);
     this.deps.saveSettingsDebounced();
     this.updateColumns();
     return true;
@@ -1793,14 +1865,68 @@ class Stage {
     event.preventDefault();
     event.stopPropagation();
     const point = this.toStagePoint(event);
-    this.drag = {
+    const drag = {
       entry,
       pointerId: event.pointerId,
       offsetX: point.x - entry.model.x,
       offsetY: point.y - entry.model.y,
-      moved: false
+      moved: false,
+      menu: false
     };
+    this.drag = drag;
     this.suppressClick = true;
+    if (event.pointerType !== "mouse") {
+      const { clientX, clientY } = event;
+      this.cancelLongPress();
+      this.longPress = window.setTimeout(() => {
+        this.longPress = null;
+        if (this.drag !== drag || drag.moved || !this.loaded.includes(entry))
+          return;
+        if (this.openModelMenu(entry, clientX, clientY))
+          drag.menu = true;
+      }, LONG_PRESS_MS);
+    }
+  }
+  cancelLongPress() {
+    if (this.longPress !== null)
+      window.clearTimeout(this.longPress);
+    this.longPress = null;
+  }
+  onContextMenu(event) {
+    if (this.drawing)
+      return;
+    if (this.drag) {
+      event.preventDefault();
+      return;
+    }
+    const hit = this.modelAt(event);
+    if (!hit)
+      return;
+    const selection = window.getSelection();
+    if (hit.through && selection && !selection.isCollapsed)
+      return;
+    if (!this.openModelMenu(hit.entry, event.clientX, event.clientY))
+      return;
+    event.preventDefault();
+    event.stopPropagation();
+  }
+  openModelMenu(entry, clientX, clientY) {
+    this.updateColumns();
+    const items = modelMenu(this.stack, this.columns, EXTENSION_ID, entry.characterId);
+    if (!items)
+      return false;
+    this.deps.showContextMenu(clientX, clientY, items).then((key) => {
+      const { characterId } = entry;
+      if (!key || !this.entryFor(characterId))
+        return;
+      const column = this.columns.index.get(characterId) ?? 0;
+      if (key === "front" || key === "back")
+        this.restack(characterId, key === "front");
+      else if (key === "left" || key === "right")
+        this.moveToColumn(characterId, column + (key === "left" ? -1 : 1));
+      this.deps.layoutChanged();
+    });
+    return true;
   }
   onPointerMove(event) {
     const press = this.drawing?.press;
@@ -1855,10 +1981,10 @@ class Stage {
   }
   dragTo(drag, event) {
     const { entry } = drag;
-    if (!this.loaded.includes(entry))
+    if (drag.menu || !this.loaded.includes(entry))
       return;
-    const column = this.columnOf(entry);
-    if (column.width === 0 || column.height === 0)
+    const { width } = this.hostSize();
+    if (width === 0)
       return;
     const point = this.toStagePoint(event);
     const newX = point.x - drag.offsetX;
@@ -1866,6 +1992,12 @@ class Stage {
     if (!drag.moved && Math.abs(newX - entry.model.x) < 3 && Math.abs(newY - entry.model.y) < 3)
       return;
     drag.moved = true;
+    this.cancelLongPress();
+    if (this.columns.count > 1)
+      this.moveToColumn(entry.characterId, Math.floor(newX / (width / this.columns.count)));
+    const column = this.columnOf(entry);
+    if (column.width === 0 || column.height === 0)
+      return;
     const settings = this.settingsFor(entry);
     const percent = (value) => Math.min(100, Math.max(-100, Math.round(value)));
     settings.x = percent((newX - column.x - column.width / 2) / (column.width / 2) * 100);
@@ -1897,10 +2029,11 @@ class Stage {
     event.preventDefault();
     event.stopPropagation();
     this.endDrag();
-    if (!drag.moved && this.loaded.includes(drag.entry))
+    if (!drag.moved && !drag.menu && this.loaded.includes(drag.entry))
       this.onModelClick(drag.entry, event);
   }
   endDrag() {
+    this.cancelLongPress();
     this.drag = null;
     this.pendingTap = null;
     window.setTimeout(() => {
@@ -2316,6 +2449,7 @@ class Stage {
     if (this.drag)
       this.suppressClick = false;
     this.drag = null;
+    this.cancelLongPress();
     this.setHovering(false);
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
@@ -2759,7 +2893,7 @@ class SettingsUI {
         bindingSection.appendChild(note("Your library is empty: import a model in Model library below first."));
       }
       if (isGroup) {
-        bindingSection.appendChild(note("Group chat: every member with a model is shown, side by side in equal columns in member order " + "(Live2D and, with the Spine Avatars extension, Spine models). Zoom 1 fits the model in its column, " + "and X and Y offset and Fit to canvas work within that column. Where models overlap, Send to front and " + "Send to back in Model settings choose which one is drawn on top."));
+        bindingSection.appendChild(note("Group chat: every member with a model is shown, side by side in equal columns " + "(Live2D and, with the Spine Avatars extension, Spine models). " + "Drag a model sideways into another column to reorder them. Zoom 1 fits the model in its column, " + "and X and Y offset and Fit to canvas work within that column. Right-click a model (or touch and hold it) " + "to send it to the front or back where models overlap, or to move it left or right."));
       }
       const characterName = () => characters.find((character) => character.id === this.selectedCharacterId)?.name.replace(/ \(in this chat\)$/, "") ?? "Character";
       const fileStatus = el("span", "l2d-dim", this.fileStatusText);
@@ -3739,6 +3873,7 @@ function setup(ctx) {
     getModelSettings: getOrCreateModelSettings,
     saveSettingsDebounced: saveDebounced,
     layoutChanged: () => ui.layoutChanged(),
+    showContextMenu: async (x, y, items) => (await ctx.ui.showContextMenu({ position: { x, y }, items })).selectedKey ?? null,
     assets,
     layer: () => overlayActive ? backgroundModeOn() ? "background" : "front" : null,
     sendInteraction: (message, characterId) => {
