@@ -1010,20 +1010,28 @@ async function checkReorder(members, owners) {
   await checkColumns(owners, 'after Move left in the menu');
   await page.screenshot({ path: `${OUT}/reorder-move-left.png` });
 
-  // A long touch on member 2's model (column 2) opens the menu too: Send to front.
+  // A long touch on member 2's model (column 2) opens the menu too. Send to
+  // front (or, when an earlier run left it in front and that item is greyed
+  // out, Send to back) restacks it.
   const ext = EXTENSIONS[owners[1]];
   const target = (await columnInfo(ext, count)).columns[1].box;
   menu = await touchHold(center(target), target.y + target.height * 0.4, 900);
   check(!!menu, `a long touch on member 2's ${ext.tab} model opens its menu`);
   await page.screenshot({ path: `${OUT}/reorder-long-press-menu.png` });
   if (menu) {
-    await menu.locator("button", { hasText: "Send to front" }).click();
+    const front = menu.locator('button', { hasText: 'Send to front' });
+    const toFront = await front.isEnabled();
+    check(
+      toFront || (await menu.locator('button', { hasText: 'Send to back' }).isEnabled()),
+      'the menu offers Send to front or Send to back',
+    );
+    await (toFront ? front : menu.locator('button', { hasText: 'Send to back' })).click();
     await page.waitForTimeout(1500);
     const stack = await canvasStack(count);
-    const top = stack[stack.length - 1];
+    const end = stack[toFront ? stack.length - 1 : 0];
     check(
-      top?.owner === `${owners[1]}_avatars` && top.drawn[1] > 0.01,
-      `Send to front from the menu puts member 2's ${ext.tab} model on top`,
+      end?.owner === `${owners[1]}_avatars` && end.drawn[1] > 0.01,
+      `${toFront ? 'Send to front' : 'Send to back'} from the menu puts member 2's ${ext.tab} model ${toFront ? 'on top' : 'at the bottom'}`,
     );
   }
   // A right-click off the models leaves the browser's own menu alone.
