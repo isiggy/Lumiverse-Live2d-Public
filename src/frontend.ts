@@ -33,10 +33,18 @@ const STAGE_CSS = `
 html.live2d-avatars-hover, html.live2d-avatars-hover * { cursor: grab !important; }
 html.live2d-avatars-tap, html.live2d-avatars-tap * { cursor: pointer !important; }
 html.live2d-avatars-drawing, html.live2d-avatars-drawing * { cursor: crosshair !important; }
+.live2d-avatars-bar-button { display: flex; align-items: center; justify-content: center; flex-shrink: 0; width: 30px; height: 26px; padding: 0; border: none; border-radius: var(--lcs-radius-xs, 6px); background: transparent; color: var(--lumiverse-text-dim, rgba(230, 230, 240, 0.4)); cursor: pointer; transition: color 120ms ease, background 120ms ease; }
+.live2d-avatars-bar-button:hover { color: var(--lumiverse-text, rgba(230, 230, 240, 0.92)); background: var(--lumiverse-fill, rgba(255, 255, 255, 0.06)); }
+.live2d-avatars-bar-button svg { width: 16px; height: 16px; }
 `;
 
 const TAB_ICON =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4.2"/><path d="M9.5 7.5h.01M14.5 7.5h.01"/><path d="M10 10c.6.6 1.3.9 2 .9s1.4-.3 2-.9"/><path d="M4.5 21c.8-3.6 3.9-6 7.5-6s6.7 2.4 7.5 6"/></svg>';
+
+// The chat menu bar's reload button: a refresh arrow around the tab icon's figure, so it doesn't look
+// like Lumiverse's own Regenerate.
+const RELOAD_ICON =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.5 12a8.5 8.5 0 1 1-2.5-6"/><path d="M18.6 2.5v4h-4"/><circle cx="12" cy="10.2" r="2.2"/><path d="M8.3 16.4c.7-1.9 2.1-2.9 3.7-2.9s3 1 3.7 2.9"/></svg>';
 
 function downloadJson(fileName: string, value: unknown): void {
   const url = URL.createObjectURL(new Blob([JSON.stringify(value, null, 2)], { type: 'application/json' }));
@@ -218,6 +226,24 @@ export function setup(ctx: SpindleFrontendContext) {
   // ── Settings tab ──────────────────────────────────────────────────────────
   let classifyPending: { resolve: (label: string) => void; reject: (error: Error) => void } | null = null;
 
+  // ── Reload button in the chat's menu bar ──
+  // Lumiverse's chat_actions mount sits in the row of icons above the message input.
+  const chatBar = ctx.ui.mount('chat_actions') as HTMLElement;
+  chatBar.style.display = 'contents';
+  const chatBarButton = document.createElement('button');
+  chatBarButton.type = 'button';
+  chatBarButton.className = 'live2d-avatars-bar-button';
+  chatBarButton.title = 'Reload Live2D models';
+  chatBarButton.setAttribute('aria-label', 'Reload Live2D models');
+  chatBarButton.innerHTML = RELOAD_ICON;
+  chatBarButton.addEventListener('click', () => controller.reloadStage());
+  const syncChatBarButton = () => {
+    const show = settings.global.enabled && settings.global.showReloadButton;
+    if (show && chatBarButton.parentElement !== chatBar) chatBar.replaceChildren(chatBarButton);
+    else if (!show && chatBarButton.parentElement) chatBarButton.remove();
+  };
+  cleanups.push(() => chatBarButton.remove());
+
   const controller: UIController = {
     getSettings: () => settings,
     getModels: () => models,
@@ -231,6 +257,7 @@ export function setup(ctx: SpindleFrontendContext) {
       applyBackgroundMode();
       void stage.reload();
     },
+    syncChatBarButton: () => syncChatBarButton(),
     importZip: async (status) => {
       const files = await ctx.uploads.pickFile({
         accept: ['.zip', 'application/zip'],

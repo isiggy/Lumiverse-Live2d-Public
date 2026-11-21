@@ -30,6 +30,8 @@ export interface UIController {
   saveDebounced(): void;
   saveNow(): void;
   reloadStage(): void;
+  /** Show or hide the reload button in the chat's menu bar to match the settings. */
+  syncChatBarButton(): void;
   importZip(status: (text: string) => void): Promise<void>;
   deleteModel(modelId: string): Promise<void>;
   classifyTest(text: string): Promise<string>;
@@ -288,6 +290,11 @@ function note(text: string): HTMLParagraphElement {
   return el('p', 'l2d-note', text);
 }
 
+/** An explanation that the Show help text setting hides. */
+function help(text: string): HTMLParagraphElement {
+  return el('p', 'l2d-note l2d-help', text);
+}
+
 /** A line that explains why a button didn't do anything; empty otherwise. */
 function statusLine(): { root: HTMLSpanElement; say(text: string): void } {
   const root = el('span', 'l2d-dim', '');
@@ -461,6 +468,8 @@ export class SettingsUI {
     this.pendingMounts = [];
     root.replaceChildren();
     root.classList.add('l2d-root');
+    root.classList.toggle('l2d-hide-help', !this.controller.getSettings().global.showHelp);
+    this.controller.syncChatBarButton();
     this.syncLayout = null;
 
     const controller = this.controller;
@@ -491,6 +500,7 @@ export class SettingsUI {
           globals.enabled = value;
           controller.saveNow();
           controller.reloadStage();
+          controller.syncChatBarButton();
         }),
         checkbox(
           'Show model as chat background',
@@ -535,10 +545,50 @@ export class SettingsUI {
             },
           ),
         ),
-        note('Each new character message plays the animation mapped to its emotion (Model settings → Emotion mappings).'),
+        help('Each new character message plays the animation mapped to its emotion (Model settings → Emotion mappings).'),
         controller.usingOverlay()
           ? null
           : note('Overlay permission not granted — the avatar renders in the preview box below.'),
+        checkbox(
+          'Show help text',
+          globals.showHelp,
+          (value) => {
+            globals.showHelp = value;
+            controller.saveDebounced();
+            root.classList.toggle('l2d-hide-help', !value);
+          },
+          'The explanations under the settings, like this one.',
+        ),
+      ]),
+    );
+
+    // ── Debug ──
+    root.appendChild(
+      section('Debug', [
+        checkbox('Reset model before animations (force animation)', globals.force_animation, (value) => {
+          globals.force_animation = value;
+          controller.saveDebounced();
+        }),
+        checkbox('Force animations to loop', globals.force_loop, (value) => {
+          globals.force_loop = value;
+          controller.saveDebounced();
+        }),
+        checkbox('Show model frames & hit areas', globals.showFrames, (value) => {
+          globals.showFrames = value;
+          controller.saveDebounced();
+          controller.stage.setShowFrames(value);
+        }),
+        checkbox(
+          'Reload button in the chat menu bar',
+          globals.showReloadButton,
+          (value) => {
+            globals.showReloadButton = value;
+            controller.saveDebounced();
+            controller.syncChatBarButton();
+          },
+          'Adds a button that reloads the Live2D models next to the chat’s other icons, above the message input.',
+        ),
+        row(button('Reload Live2D', () => controller.reloadStage())),
       ]),
     );
 
@@ -631,7 +681,7 @@ export class SettingsUI {
       }
       if (isGroup) {
         bindingSection.appendChild(
-          note(
+          help(
             'Group chat: every member with a model is shown, side by side in equal columns ' +
               '(Live2D and, with the Spine Avatars extension, Spine models). ' +
               'Drag a model sideways into another column to reorder them. Zoom 1 fits the model in its column, ' +
@@ -788,7 +838,7 @@ export class SettingsUI {
     this.renderLibraryList(libraryList);
     if (models.length > 0) {
       library.appendChild(
-        note(
+        help(
           'A sillytavern_settings.json preset in a model’s folder is applied automatically. ' +
             'A model’s thumbnail is taken the first time it’s shown; the highlighted one is the selected character’s.',
         ),
@@ -833,29 +883,6 @@ export class SettingsUI {
       ),
     );
 
-    // ── Debug ──
-    root.appendChild(
-      section(
-        'Debug',
-        [
-          checkbox('Reset model before animations (force animation)', globals.force_animation, (value) => {
-            globals.force_animation = value;
-            controller.saveDebounced();
-          }),
-          checkbox('Force animations to loop', globals.force_loop, (value) => {
-            globals.force_loop = value;
-            controller.saveDebounced();
-          }),
-          checkbox('Show model frames & hit areas', globals.showFrames, (value) => {
-            globals.showFrames = value;
-            controller.saveDebounced();
-            controller.stage.setShowFrames(value);
-          }),
-          row(button('Reload Live2D', () => controller.reloadStage())),
-        ],
-        { open: false },
-      ),
-    );
 
     for (const mount of this.pendingMounts.splice(0)) mount();
   }
@@ -1106,7 +1133,7 @@ export class SettingsUI {
         'Cuts off backdrops and effects that full-scene models draw past their own edges.',
       ),
     );
-    view.appendChild(note('Drag the model on the stage to move it.'));
+    view.appendChild(help('Drag the model on the stage to move it.'));
     host.appendChild(section('View', [view]));
 
     // ── Animations: starter / default / click ──
@@ -1151,7 +1178,7 @@ export class SettingsUI {
       changed();
     });
     clickRow.appendChild(field('Message', clickMessage));
-    clickRow.appendChild(note('Plays when you click the model outside its hit areas. The message, if any, is posted to the chat.'));
+    clickRow.appendChild(help('Plays when you click the model outside its hit areas. The message, if any, is posted to the chat.'));
     animations.appendChild(clickRow);
     host.appendChild(section('Animations', [animations]));
 
@@ -1201,7 +1228,7 @@ export class SettingsUI {
     renderClassify();
     classify.append(emotionStatus.root, grid);
     classify.appendChild(
-      note(
+      help(
         'A new character message plays the expression and motion mapped to its emotion. Dimmed rows play nothing. ' +
           'A motion can also be one of the model’s taps: it plays what that tap is set to in Hit areas ' +
           '(its motion, and its expression unless the emotion has one), without sending the tap’s message.',
@@ -1266,7 +1293,7 @@ export class SettingsUI {
       );
     }
     cursor.appendChild(
-      note('The parameters the model turns toward the cursor (Global → Follow cursor). Auto-detected on first load when the model uses standard names.'),
+      help('The parameters the model turns toward the cursor (Global → Follow cursor). Auto-detected on first load when the model uses standard names.'),
     );
     host.appendChild(section('Cursor tracking', [cursor], { open: false }));
   }
@@ -1311,7 +1338,7 @@ export class SettingsUI {
       }),
     );
     host.appendChild(
-      note(
+      help(
         'Tap a hit area on the model to play what it’s set to. Where areas overlap, the smallest one wins; ' +
           'a tap anywhere else on the model plays the “On click” animation.',
       ),
@@ -1386,7 +1413,7 @@ export class SettingsUI {
       host.appendChild(el('div', 'l2d-anim-title', description.hitAreasDetected ? 'Found in the model' : 'From the model file'));
       if (description.hitAreasDetected) {
         host.appendChild(
-          note(
+          help(
             'The model’s file lists no hit areas, but the model has art meshes named like them (Touch…, HitArea…), ' +
               'as models from games often do. These follow the model’s animation.',
           ),
@@ -1559,6 +1586,7 @@ export const UI_CSS = `
 .l2d-check input { margin: 2px 0 0; flex: none; accent-color: var(--lumiverse-primary, var(--lumiverse-accent)); }
 .l2d-check-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .l2d-hint { color: var(--lumiverse-text-dim); font-size: 12px; line-height: 1.4; }
+.l2d-hide-help .l2d-help, .l2d-hide-help .l2d-hint { display: none; }
 .l2d-select { max-width: 100%; min-width: 0; padding: 4px 6px; border-radius: var(--lumiverse-radius); border: 1px solid var(--lumiverse-border); background: var(--lumiverse-fill); color: var(--lumiverse-text); font: inherit; text-overflow: ellipsis; }
 .l2d-input { flex: 1; min-width: 120px; padding: 4px 8px; border-radius: var(--lumiverse-radius); border: 1px solid var(--lumiverse-border); background: var(--lumiverse-fill); color: var(--lumiverse-text); font: inherit; }
 .l2d-slider { margin: 6px 0 2px; }
