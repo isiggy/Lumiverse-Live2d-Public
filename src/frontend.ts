@@ -8,7 +8,7 @@
 import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
 import { ModelAssets } from './frontend/assets';
 import { placeAvatarLayers } from './frontend/columns';
-import { applyTapMotions } from './frontend/hit-areas';
+import { applyTapMotions, suggestAreaMotion } from './frontend/hit-areas';
 import { Stage, type ModelDescription } from './frontend/stage';
 import { SettingsUI, UI_CSS, type UIController } from './frontend/ui';
 import { tusUpload } from './frontend/tus';
@@ -95,6 +95,14 @@ export function setup(ctx: SpindleFrontendContext) {
       byCharacter[modelId] = modelSettings;
       saveDebounced();
     } else {
+      // A hit area seen for the first time (found in the model, or newly named) plays the model's motion for it.
+      for (const area of description?.hitAreas ?? []) {
+        if (area in modelSettings.hit_areas) continue;
+        const motion = suggestAreaMotion(area, description!.motions);
+        if (motion === 'none') continue;
+        modelSettings.hit_areas[area] = { expression: 'none', motion, message: '' };
+        saveDebounced();
+      }
       ensureModelSettingsShape(modelSettings, description?.hitAreas ?? []);
     }
     return modelSettings;

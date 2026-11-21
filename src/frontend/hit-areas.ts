@@ -10,6 +10,20 @@ import type { ClickAnimation, ModelSettings } from '../shared/settings';
 export interface HitAreaDef {
   name: string;
   drawableId: string;
+  /** Found by its art mesh's name (see detectHitAreaMeshes) rather than listed in the model file. */
+  detected?: boolean;
+}
+
+/**
+ * Art meshes that look like hit areas by name, for models whose file lists
+ * none: games often ship their models with the hit areas as invisible
+ * meshes ("TouchHead", "TouchBody" in Azur Lane models, "HitAreaHead" in
+ * Cubism samples) and wire them up in their own code. The name must start
+ * with Touch or Hit followed by a capital, digit or separator (or with HitArea), so
+ * an ArtMesh called "Touchpad" or "Hitomi" isn't taken.
+ */
+export function detectHitAreaMeshes(drawableIds: string[]): string[] {
+  return drawableIds.filter((id) => /^hit_?area/i.test(id) || /^([Tt]ouch|[Hh]it)([A-Z0-9_\-.@]|$)/.test(id));
 }
 
 /**
@@ -55,7 +69,15 @@ function groupMotion(motions: Record<string, string[]>, wanted: string[]): strin
 export function suggestAreaMotion(area: string, motions: Record<string, string[]>): string {
   const name = squash(area).replace(/^hitarea/, '').replace(/hitarea$/, '');
   if (!name) return 'none';
-  return groupMotion(motions, [`tap${name}`, `touch${name}`, `${name}tap`, `${name}touch`, `click${name}`]);
+  // An area named like its motion group ("TouchHead" and "touch_head") is the surest match.
+  return groupMotion(motions, [
+    squash(area),
+    `tap${name}`,
+    `touch${name}`,
+    `${name}tap`,
+    `${name}touch`,
+    `click${name}`,
+  ]);
 }
 
 /** The motion group a model seems to have for a tap anywhere on it ("Tap", "tap", "touch", "TapBody"…). */

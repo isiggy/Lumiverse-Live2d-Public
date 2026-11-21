@@ -1083,7 +1083,15 @@ export class SettingsUI {
     };
 
     if (modelAreas.length > 0) {
-      host.appendChild(el('div', 'l2d-anim-title', 'From the model file'));
+      host.appendChild(el('div', 'l2d-anim-title', description.hitAreasDetected ? 'Found in the model' : 'From the model file'));
+      if (description.hitAreasDetected) {
+        host.appendChild(
+          note(
+            'The model’s file lists no hit areas, but the model has art meshes named like them (Touch…, HitArea…), ' +
+              'as models from games often do. These follow the model’s animation.',
+          ),
+        );
+      }
       for (const area of modelAreas) {
         host.appendChild(row(el('span', 'l2d-emotion', area), ...mappingControls(area)));
       }

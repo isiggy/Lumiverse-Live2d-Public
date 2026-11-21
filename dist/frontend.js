@@ -500,6 +500,9 @@ function releaseAvatarLayers() {
 }
 
 // src/frontend/hit-areas.ts
+function detectHitAreaMeshes(drawableIds) {
+  return drawableIds.filter((id) => /^hit_?area/i.test(id) || /^([Tt]ouch|[Hh]it)([A-Z0-9_\-.@]|$)/.test(id));
+}
 function hitAreaDefsFromBundle(bundleJson, cubism) {
   const raw = cubism === 4 ? bundleJson?.HitAreas : bundleJson?.hit_areas;
   if (!Array.isArray(raw))
@@ -535,7 +538,14 @@ function suggestAreaMotion(area, motions) {
   const name = squash(area).replace(/^hitarea/, "").replace(/hitarea$/, "");
   if (!name)
     return "none";
-  return groupMotion(motions, [`tap${name}`, `touch${name}`, `${name}tap`, `${name}touch`, `click${name}`]);
+  return groupMotion(motions, [
+    squash(area),
+    `tap${name}`,
+    `touch${name}`,
+    `${name}tap`,
+    `${name}touch`,
+    `click${name}`
+  ]);
 }
 function suggestClickMotion(motions) {
   return groupMotion(motions, ["tap", "touch", "click", "tapbody", "touchbody"]);
@@ -1023,6 +1033,49 @@ function modelSize(model) {
     height: model.internalModel?.height || model.height || 1
   };
 }
+function drawableRect(model, drawableId) {
+  const internal = model?.internalModel;
+  const index = internal?.getDrawableIndex?.(drawableId);
+  if (typeof index !== "number" || index < 0)
+    return null;
+  const bounds = internal.getDrawableBounds(index, {});
+  const transform = internal.localTransform;
+  const a = transform.apply({ x: bounds.x, y: bounds.y });
+  const b = transform.apply({ x: bounds.x + bounds.width, y: bounds.y + bounds.height });
+  return { x: Math.min(a.x, b.x), y: Math.min(a.y, b.y), width: Math.abs(b.x - a.x), height: Math.abs(b.y - a.y) };
+}
+function hitAreaDefsFor(model, json, cubism) {
+  const listed = hitAreaDefsFromBundle(json, cubism);
+  if (listed.length > 0)
+    return listed;
+  let ids = [];
+  try {
+    ids = model.internalModel.getDrawableIDs() ?? [];
+    if (detectHitAreaMeshes(ids).length > 0)
+      model.internalModel.coreModel?.update?.();
+  } catch {
+    return [];
+  }
+  const { width, height } = modelSize(model);
+  const defs = [];
+  for (const id of detectHitAreaMeshes(ids)) {
+    if (defs.some((def) => def.name === id))
+      continue;
+    const rect = drawableRect(model, id);
+    if (!rect || rect.width <= 0 || rect.height <= 0)
+      continue;
+    const onCanvas = rect.x < width && rect.y < height && rect.x + rect.width > 0 && rect.y + rect.height > 0;
+    if (onCanvas)
+      defs.push({ name: id, drawableId: id, detected: true });
+  }
+  return defs;
+}
+function describeHitAreas(defs) {
+  return {
+    hitAreas: [...new Set(defs.map((def) => def.name))],
+    hitAreasDetected: defs.length > 0 && defs.every((def) => def.detected)
+  };
+}
 function isEmptyMapping(mapping) {
   return !mapping || mapping.expression === "none" && mapping.motion === "none" && !mapping.message;
 }
@@ -1279,12 +1332,15 @@ class Stage {
       return;
     }
     const parameterIds = model.internalModel.coreModel?._model?.parameters?.ids ?? [];
+    const hitAreaDefs = hitAreaDefsFor(model, json, bundle.cubism);
     const description = {
       ...partialDescription,
+      ...describeHitAreas(hitAreaDefs),
       parameterIds: [...parameterIds].sort(),
       size: modelSize(model)
     };
     this.descriptionCache.set(`${record.id}@${record.version}`, description);
+    this.deps.getModelSettings(characterId, record.id, description);
     this.autoDetectParameters(modelSettings, description.parameterIds);
     const { app, canvas } = this.createApp(PIXI, host);
     app.stage.addChild(model);
@@ -1307,7 +1363,7 @@ class Stage {
       loopingMotion: null,
       starterTimer: null,
       thumbnailTimer: null,
-      hitAreaDefs: hitAreaDefsFromBundle(json, bundle.cubism),
+      hitAreaDefs,
       areaFrames: null,
       flash: null
     };
@@ -1472,16 +1528,22 @@ class Stage {
     const live = this.loaded.find((entry) => entry.modelId === record.id);
     if (live) {
       const parameterIds = live.model.internalModel.coreModel?._model?.parameters?.ids ?? [];
-      const description = { ...partial, parameterIds: [...parameterIds].sort(), size: modelSize(live.model) };
+      const description = {
+        ...partial,
+        ...describeHitAreas(live.hitAreaDefs),
+        parameterIds: [...parameterIds].sort(),
+        size: modelSize(live.model)
+      };
       this.descriptionCache.set(`${record.id}@${record.version}`, description);
       return description;
     }
     const { model, objectUrls } = await this.instantiate(PIXI, bundle, json, 45);
     const parameterIds = model.internalModel.coreModel?._model?.parameters?.ids ?? [];
     const size = modelSize(model);
+    const hitAreas = describeHitAreas(hitAreaDefsFor(model, json, bundle.cubism));
     model.destroy(true, true, true);
     objectUrls.forEach((url) => URL.revokeObjectURL(url));
-    const description = { ...partial, parameterIds: [...parameterIds].sort(), size };
+    const description = { ...partial, ...hitAreas, parameterIds: [...parameterIds].sort(), size };
     this.descriptionCache.set(`${record.id}@${record.version}`, description);
     return description;
   }
@@ -1773,15 +1835,7 @@ class Stage {
     return { x: local.x, y: local.y };
   }
   modelAreaRect(entry, def) {
-    const internal = entry.model?.internalModel;
-    const index = internal?.getDrawableIndex?.(def.drawableId);
-    if (typeof index !== "number" || index < 0)
-      return null;
-    const bounds = internal.getDrawableBounds(index, {});
-    const transform = internal.localTransform;
-    const a = transform.apply({ x: bounds.x, y: bounds.y });
-    const b = transform.apply({ x: bounds.x + bounds.width, y: bounds.y + bounds.height });
-    return { x: Math.min(a.x, b.x), y: Math.min(a.y, b.y), width: Math.abs(b.x - a.x), height: Math.abs(b.y - a.y) };
+    return drawableRect(entry.model, def.drawableId);
   }
   customAreaRect(entry, area) {
     const { width, height } = modelSize(entry.model);
@@ -2920,7 +2974,10 @@ Used by ${used} character${used === 1 ? "" : "s"}` : ""}`;
       }, 500);
     };
     if (modelAreas.length > 0) {
-      host.appendChild(el("div", "l2d-anim-title", "From the model file"));
+      host.appendChild(el("div", "l2d-anim-title", description.hitAreasDetected ? "Found in the model" : "From the model file"));
+      if (description.hitAreasDetected) {
+        host.appendChild(note("The model’s file lists no hit areas, but the model has art meshes named like them (Touch…, HitArea…), " + "as models from games often do. These follow the model’s animation."));
+      }
       for (const area of modelAreas) {
         host.appendChild(row(el("span", "l2d-emotion", area), ...mappingControls(area)));
       }
@@ -3256,6 +3313,15 @@ function setup(ctx) {
       byCharacter[modelId] = modelSettings;
       saveDebounced();
     } else {
+      for (const area of description?.hitAreas ?? []) {
+        if (area in modelSettings.hit_areas)
+          continue;
+        const motion = suggestAreaMotion(area, description.motions);
+        if (motion === "none")
+          continue;
+        modelSettings.hit_areas[area] = { expression: "none", motion, message: "" };
+        saveDebounced();
+      }
       ensureModelSettingsShape(modelSettings, description?.hitAreas ?? []);
     }
     return modelSettings;
